@@ -1,7 +1,7 @@
 {
-  "name": "D휴가",
-  "short_name": "D휴가",
-  "description": "경산·문양승무팀 휴가 관리 앱",
+  "name": "D휴가(테스트)",
+  "short_name": "D휴가T",
+  "description": "경산·문양승무팀 휴가 관리 앱 (문양 테스트버전)",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
