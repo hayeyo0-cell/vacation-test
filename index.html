@@ -1,1 +1,407 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>D휴가</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icon-192.png" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<meta name="theme-color" content="#1b3a5c" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", sans-serif;
+    background: #f7f4ee;
+    color: #1a1a1a;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #root { min-height: 100vh; }
 
+  /* PC 등 넓은 화면에서는 모바일 폭을 확대해서 보여줌 (관리자는 주로 PC에서 사용) */
+  @media (min-width: 640px) {
+    body { background: #e7e2d5; }
+    #root > div {
+      max-width: 525px; /* 지금보다 80% 크기로 추가 축소 */
+      margin: 0 auto;
+      min-height: 100vh;
+      box-shadow: 0 0 50px rgba(0,0,0,0.12);
+      zoom: 1.4; /* 크롬/엣지 - 글씨·버튼·달력 격자 전부 같이 커짐 */
+    }
+  }
+  /* zoom 미지원 브라우저(파이어폭스 등) 대체 - transform 확대 */
+  @supports not (zoom: 1) {
+    @media (min-width: 640px) {
+      #root > div {
+        transform: scale(1.4);
+        transform-origin: top center;
+      }
+    }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel (JSX를 브라우저에서 바로 변환) -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Firebase (모듈형 SDK, CDN) -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+  import {
+    getFirestore,
+    collection,
+    addDoc,
+    getDocs,
+    getDoc,
+    setDoc,
+    query,
+    where,
+    doc,
+    updateDoc,
+    deleteDoc,
+    serverTimestamp,
+    onSnapshot,
+  } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBrBlZXbA-Tt68cnXk2XKQYms7wI3owCVI",
+    authDomain: "vacation-31f9f.firebaseapp.com",
+    projectId: "vacation-31f9f",
+    storageBucket: "vacation-31f9f.firebasestorage.app",
+    messagingSenderId: "1015564758748",
+    appId: "1:1015564758748:web:11561d3fcf11f564308e19"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  const COLLECTION = "vacations";
+  const APPROVAL_COLLECTION = "approvals";
+  const MANAGER_COLLECTION = "managers";
+  const QUOTA_COLLECTION = "quotas";
+  const LOTTERY_EVENT_COLLECTION = "lottery_events";
+  const LOTTERY_ENTRY_COLLECTION = "lottery_entries";
+  const SYSTEM_COLLECTION = "system";
+
+  // app.js(Babel 스크립트)에서 window.VacationAPI.xxx() 형태로 호출
+  window.VacationAPI = {
+    // 특정 날짜의 휴가 기록 전체 조회 (취소된 것 포함)
+    async getByDate(dateStr) {
+      const q = query(collection(db, COLLECTION), where("date", "==", dateStr));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 월 범위 조회 (달력용) - startStr, endStr: "YYYY-MM-DD"
+    async getByRange(startStr, endStr) {
+      const q = query(
+        collection(db, COLLECTION),
+        where("date", ">=", startStr),
+        where("date", "<=", endStr)
+      );
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 전체 휴가 기록 조회 (백업용 - 날짜 필터 없이 전부)
+    async getAll() {
+      const snap = await getDocs(collection(db, COLLECTION));
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 월 범위 실시간 구독 - 다른 사람이 신청/취소/확인할 때마다 callback이 자동으로 다시 호출됨.
+    // 반환값(구독 해제 함수)을 호출하면 구독이 끊겨요 (컴포넌트 unmount/월 변경 시 꼭 호출해야 함).
+    subscribeRange(startStr, endStr, callback) {
+      const q = query(
+        collection(db, COLLECTION),
+        where("date", ">=", startStr),
+        where("date", "<=", endStr)
+      );
+      return onSnapshot(
+        q,
+        (snap) => {
+          const records = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          callback(records);
+        },
+        (err) => {
+          console.error("실시간 구독 오류:", err);
+        }
+      );
+    },
+    // 새 휴가 등록
+    async add(record) {
+      const ref = await addDoc(collection(db, COLLECTION), {
+        ...record,
+        status: "정상",
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      return ref.id;
+    },
+    // 본인 셀프 신청 전용 - "직원ID_날짜"를 고정 ID로 써서, 느린 기기에서 저장을 여러 번 눌러도
+    // 같은 문서 하나에만 덮어써져서 물리적으로 중복 생성이 불가능해요.
+    async addOnce(id, record) {
+      await setDoc(doc(db, COLLECTION, id), {
+        ...record,
+        status: "정상",
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      return id;
+    },
+    // 기존 기록 수정 (본인 것만 - 화면단에서 제한)
+    async update(id, patch) {
+      await updateDoc(doc(db, COLLECTION, id), {
+        ...patch,
+        updatedAt: serverTimestamp(),
+      });
+    },
+    // 취소 처리 (삭제 아님, 상태만 변경)
+    async cancel(id) {
+      await updateDoc(doc(db, COLLECTION, id), {
+        status: "취소됨",
+        updatedAt: serverTimestamp(),
+      });
+    },
+    // 완전 삭제 (관리자 전용 - 되돌릴 수 없음)
+    async remove(id) {
+      await deleteDoc(doc(db, COLLECTION, id));
+    },
+    // 중간관리자 확인 도장
+    async confirm(id, managerName) {
+      await updateDoc(doc(db, COLLECTION, id), {
+        confirmedBy: managerName,
+        confirmedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    },
+    // 특정 직원의 전체 기록 조회 (날짜 필터는 호출부에서 처리)
+    async getMine(employeeId) {
+      const q = query(collection(db, COLLECTION), where("employeeId", "==", employeeId));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 특정 직원의 전체 휴가 기록 완전 삭제 (인사이동/퇴사로 명단에서 빠졌을 때 관리자 전용, 되돌릴 수 없음)
+    async removeAllForEmployee(employeeId) {
+      const q = query(collection(db, COLLECTION), where("employeeId", "==", employeeId));
+      const snap = await getDocs(q);
+      await Promise.all(snap.docs.map((d) => deleteDoc(doc(db, COLLECTION, d.id))));
+      return snap.docs.length;
+    },
+    // 특정 소속의 휴가 기록 전체 삭제 (초기화 후 다시 가져오기용, 관리자 전용, 되돌릴 수 없음)
+    async removeAllForBranch(branch) {
+      const q = query(collection(db, COLLECTION), where("branch", "==", branch));
+      const snap = await getDocs(q);
+      await Promise.all(snap.docs.map((d) => deleteDoc(doc(db, COLLECTION, d.id))));
+      return snap.docs.length;
+    },
+    // 보관 기한(1년) 지난 오래된 기록 자동 삭제 - date < cutoffDate 인 것 전부 삭제 (저장공간 관리용)
+    async deleteOlderThan(cutoffDate) {
+      const q = query(collection(db, COLLECTION), where("date", "<", cutoffDate));
+      const snap = await getDocs(q);
+      await Promise.all(snap.docs.map((d) => deleteDoc(doc(db, COLLECTION, d.id))));
+      return snap.docs.length;
+    },
+    // (일회성) 예전에 저장된 "가져오기(자동확인)" 문구를 "확인"으로 일괄 정리
+    async fixAutoConfirmLabel() {
+      const q = query(collection(db, COLLECTION), where("confirmedBy", "==", "가져오기(자동확인)"));
+      const snap = await getDocs(q);
+      await Promise.all(
+        snap.docs.map((d) => updateDoc(doc(db, COLLECTION, d.id), { confirmedBy: "확인" }))
+      );
+      return snap.docs.length;
+    },
+  };
+
+  // 사용자 승인 관련 API
+  window.ApprovalAPI = {
+    // 최초 등록 시 승인 요청 생성/갱신 (직원ID 기준, 이미 있으면 pending으로 갱신)
+    async request(record) {
+      await setDoc(
+        doc(db, APPROVAL_COLLECTION, record.id),
+        {
+          name: record.name,
+          branch: record.branch,
+          status: "pending",
+          requestedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    },
+    // 특정 직원의 승인 상태 조회
+    async getStatus(id) {
+      const snap = await getDoc(doc(db, APPROVAL_COLLECTION, id));
+      return snap.exists() ? snap.data() : null;
+    },
+    // 대기중 목록 조회 (관리자용)
+    async listPending() {
+      const q = query(collection(db, APPROVAL_COLLECTION), where("status", "==", "pending"));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 승인된 사용자 목록 조회 (관리자용 - 기기변경 처리 대상)
+    async listApproved() {
+      const q = query(collection(db, APPROVAL_COLLECTION), where("status", "==", "approved"));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 승인/거절 처리 (관리자용)
+    async setStatus(id, status) {
+      await updateDoc(doc(db, APPROVAL_COLLECTION, id), {
+        status,
+        updatedAt: serverTimestamp(),
+      });
+    },
+    // 기기변경(재등록 허용) - 승인 기록을 지워서 새 기기에서 처음부터 다시 등록할 수 있게 함
+    // (재등록 후에는 다시 승인 대기 상태를 거쳐요)
+    async reset(id) {
+      await deleteDoc(doc(db, APPROVAL_COLLECTION, id));
+    },
+    // (테스트용) 승인 기록 전체 삭제 - 실제 운영 시작하면 이 기능은 안 쓰는 게 좋아요
+    async deleteAll() {
+      const snap = await getDocs(collection(db, APPROVAL_COLLECTION));
+      await Promise.all(snap.docs.map((d) => deleteDoc(doc(db, APPROVAL_COLLECTION, d.id))));
+      return snap.docs.length;
+    },
+  };
+
+  // 운용(중간관리자) 명단 관리 API - 관리자가 앱 내에서 인사이동 반영
+  window.ManagerAPI = {
+    // 전체 운용 명단 조회
+    async list() {
+      const snap = await getDocs(collection(db, MANAGER_COLLECTION));
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 운용 인원 추가
+    async add(record) {
+      const ref = await addDoc(collection(db, MANAGER_COLLECTION), {
+        name: record.name,
+        branch: record.branch,
+        createdAt: serverTimestamp(),
+      });
+      return ref.id;
+    },
+    // 운용 인원 삭제 (인사이동 등)
+    async remove(id) {
+      await deleteDoc(doc(db, MANAGER_COLLECTION, id));
+    },
+  };
+
+  // 보장휴가 추가 한도(해외여행 등 예외) 관리 API - 관리자 전용
+  window.QuotaAPI = {
+    // 특정 직원의 추가 한도 조회
+    async get(employeeId) {
+      const snap = await getDoc(doc(db, QUOTA_COLLECTION, employeeId));
+      return snap.exists() ? snap.data() : null;
+    },
+    // 추가 한도 설정 (기본 10개 + extra개)
+    async setExtra(employeeId, name, branch, extra) {
+      await setDoc(
+        doc(db, QUOTA_COLLECTION, employeeId),
+        { name, branch, extra, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+    },
+    // 추가 한도가 설정된 전체 목록 조회 (관리자용)
+    async list() {
+      const snap = await getDocs(collection(db, QUOTA_COLLECTION));
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+  };
+
+  // 명절 연휴 추첨 - 이벤트(응모 기간/대상 날짜) 관리 API (경산 전용, 관리자)
+  window.LotteryAPI = {
+    // 전체 이벤트 목록 (최신순)
+    async listEvents() {
+      const snap = await getDocs(collection(db, LOTTERY_EVENT_COLLECTION));
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      list.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+      return list;
+    },
+    // 새 응모 이벤트 생성
+    async createEvent(data) {
+      const ref = await addDoc(collection(db, LOTTERY_EVENT_COLLECTION), {
+        ...data,
+        status: "응모중",
+        createdAt: serverTimestamp(),
+      });
+      return ref.id;
+    },
+    // 이벤트 정보 수정 (추첨 완료 처리 등)
+    async updateEvent(id, patch) {
+      await updateDoc(doc(db, LOTTERY_EVENT_COLLECTION, id), {
+        ...patch,
+        updatedAt: serverTimestamp(),
+      });
+    },
+    // 이벤트 삭제 (관리자 전용, 되돌릴 수 없음)
+    async removeEvent(id) {
+      await deleteDoc(doc(db, LOTTERY_EVENT_COLLECTION, id));
+    },
+    // 특정 이벤트의 응모 기록 전체 조회
+    async listEntriesForEvent(eventId) {
+      const q = query(collection(db, LOTTERY_ENTRY_COLLECTION), where("eventId", "==", eventId));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 특정 직원의 전체 응모 기록 조회 (본인 결과 확인용)
+    async listMyEntries(employeeId) {
+      const q = query(collection(db, LOTTERY_ENTRY_COLLECTION), where("employeeId", "==", employeeId));
+      const snap = await getDocs(q);
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    },
+    // 응모/재응모 - "이벤트ID_직원ID_날짜"를 고정 ID로 써서 중복 응모 방지
+    async apply(entryId, entry) {
+      await setDoc(doc(db, LOTTERY_ENTRY_COLLECTION, entryId), {
+        ...entry,
+        result: "대기중",
+        appliedAt: serverTimestamp(),
+      });
+      return entryId;
+    },
+    // 응모 취소 (응모 기간 중에만 - 화면단에서 제한)
+    async cancelApply(entryId) {
+      await deleteDoc(doc(db, LOTTERY_ENTRY_COLLECTION, entryId));
+    },
+    // 추첨 결과 반영
+    async updateEntry(entryId, patch) {
+      await updateDoc(doc(db, LOTTERY_ENTRY_COLLECTION, entryId), patch);
+    },
+  };
+
+  window.__firestoreReady = true;
+  window.dispatchEvent(new Event("firestore-ready"));
+
+  // 자동 백업 - 마지막 백업 시각 기록/조회 (매주 1회, 관리자 로그인 시 자동 확인)
+  window.BackupAPI = {
+    async getLastBackupAt() {
+      const snap = await getDoc(doc(db, SYSTEM_COLLECTION, "backupMeta"));
+      return snap.exists() ? snap.data().lastBackupAt : null;
+    },
+    async setLastBackupAt() {
+      await setDoc(
+        doc(db, SYSTEM_COLLECTION, "backupMeta"),
+        { lastBackupAt: serverTimestamp() },
+        { merge: true }
+      );
+    },
+  };
+</script>
+
+<!-- 실제 앱 코드 (JSX) -->
+<script type="text/babel" src="app.js"></script>
+
+<!-- PWA 설치를 위한 서비스워커 등록 -->
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js").catch((err) => {
+        console.warn("서비스워커 등록 실패:", err);
+      });
+    });
+  }
+</script>
+</body>
+</html>
