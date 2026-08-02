@@ -3184,6 +3184,7 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
 const ADMIN_NAMES = [
   { name: "권재림", branch: "경산" },
   { name: "권세환", branch: "경산" },
+  { name: "권재림", branch: "문양" },
 ];
 
 // 이름뿐 아니라 소속까지 같아야 관리자로 인정 (다른 소속 동명이인 방지)
