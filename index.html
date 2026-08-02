@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>D휴가(테스트)</title>
+<title>D휴가(문양테스트)</title>
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="icon-192.png" />
 <link rel="apple-touch-icon" href="icon-192.png" />
@@ -295,7 +295,7 @@
     },
   };
 
-  // 명절 연휴 추첨 API (경산 전용, 관리자)
+  // 명절 연휴 추첨 API (관리자)
   window.LotteryAPI = {
     async listEvents() {
       const snap = await getDocs(collection(db, LOTTERY_EVENT_COLLECTION));
@@ -349,6 +349,9 @@
   window.__firestoreReady = true;
   window.dispatchEvent(new Event("firestore-ready"));
 </script>
+
+<!-- 이 앱만의 로그인정보 저장 구분용 (휴가앱 실사용과 로그인정보 안 섞이게) -->
+<script>window.APP_STORAGE_SUFFIX = "_test";</script>
 
 <!-- 실제 앱 코드 (JSX) -->
 <script type="text/babel" src="app.js"></script>
