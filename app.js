@@ -1623,9 +1623,9 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
       .catch((err) => console.error("확인 대기 알림 조회 실패:", err));
   }, [currentUser.id]);
 
-  // 앱 접속(로그인) 시 한 번 - 경산 기관사, 오늘 추첨된 이벤트의 결과만 하루 동안 알림 (매너팝업 대신 단독으로)
+  // 앱 접속(로그인) 시 한 번 - 기관사, 오늘 추첨된 이벤트의 결과만 하루 동안 알림 (매너팝업 대신 단독으로)
   useEffect(() => {
-    if (isMidManager || currentUser.branch !== "경산") return;
+    if (isMidManager) return;
     waitForFirestore()
       .then(() => Promise.all([window.LotteryAPI.listEvents(), window.LotteryAPI.listMyEntries(currentUser.id)]))
       .then(([events, entries]) => {
@@ -2322,7 +2322,7 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
                 내 휴가현황
               </button>
             )}
-            {currentUser.branch === "경산" && !isMidManager && (
+            {!isMidManager && (
               <button style={adminStyles.adminBtn} onClick={() => openPanel(setShowLotteryApply)}>
                 🎋 명절 응모
               </button>
@@ -2992,17 +2992,15 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
             >
               운용 인원
             </button>
-            {currentUser.branch === "경산" && (
-              <button
-                style={styles.button}
-                onClick={() => {
-                  setShowAdminMenu(false);
-                  openPanel(setShowLotteryAdmin);
-                }}
-              >
-                🎋 명절 추첨 관리
-              </button>
-            )}
+            <button
+              style={styles.button}
+              onClick={() => {
+                setShowAdminMenu(false);
+                openPanel(setShowLotteryAdmin);
+              }}
+            >
+              🎋 명절 추첨 관리
+            </button>
             <button style={modal.closeBtn} onClick={closeModal}>닫기</button>
           </div>
         </div>
@@ -3016,7 +3014,7 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
         <MyVacationsPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
       )}
       {showLotteryAdmin && (
-        <LotteryAdminPanel onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
+        <LotteryAdminPanel branch={currentUser.branch} onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
       )}
       {showLotteryApply && (
         <LotteryApplyPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
@@ -3724,7 +3722,7 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
 /* ------------------------------------------------------------------ */
 /* 명절 연휴 추첨 - 관리자 패널 (경산 전용)                              */
 /* ------------------------------------------------------------------ */
-function LotteryAdminPanel({ onClose, employees, managers, holidaySet }) {
+function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet }) {
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [entriesByEvent, setEntriesByEvent] = useState({}); // { [eventId]: entries[] }
@@ -3746,10 +3744,10 @@ function LotteryAdminPanel({ onClose, employees, managers, holidaySet }) {
     waitForFirestore()
       .then(() => window.LotteryAPI.listEvents())
       .then((list) => {
-        const ksList = (list || []).filter((e) => e.branch === "경산");
-        setEvents(ksList);
+        const branchList = (list || []).filter((e) => e.branch === branch);
+        setEvents(branchList);
         return Promise.all(
-          ksList.map((e) =>
+          branchList.map((e) =>
             window.LotteryAPI.listEntriesForEvent(e.id).then((entries) => [e.id, entries])
           )
         );
@@ -3800,7 +3798,7 @@ function LotteryAdminPanel({ onClose, employees, managers, holidaySet }) {
     }
     setSaving(true);
     window.LotteryAPI.createEvent({
-      branch: "경산",
+      branch,
       holidayName,
       year: parseInt(year, 10),
       dates: newDates,
@@ -3853,7 +3851,7 @@ function LotteryAdminPanel({ onClose, employees, managers, holidaySet }) {
         if (dateEntries.length === 0) continue;
 
         const existing = await window.VacationAPI.getByDate(date);
-        const activeExisting = existing.filter((v) => v.branch === "경산" && v.status !== "취소됨");
+        const activeExisting = existing.filter((v) => v.branch === event.branch && v.status !== "취소됨");
         const activeCapacityCount = activeExisting.filter((v) => isCapacityType(v.vacationType)).length;
         // 명절은 특수 상황이 많아서, 자동 계산 대신 관리자가 그 날짜에 직접 지정한 인원을 그대로 써요
         const capacity = dateInfo.capacity;
@@ -3912,7 +3910,7 @@ function LotteryAdminPanel({ onClose, employees, managers, holidaySet }) {
     <div style={modal.overlay} onClick={onClose}>
       <div style={modal.sheet} onClick={(e) => e.stopPropagation()}>
         <div style={modal.dateTitle}>🎋 명절 연휴 추첨 관리</div>
-        <div style={{ ...modal.countText, marginBottom: "14px" }}>경산 전용 기능이에요</div>
+        <div style={{ ...modal.countText, marginBottom: "14px" }}>{branch} 전용 화면이에요</div>
 
         <button
           style={{ ...adminStyles.approveBtn, width: "100%", padding: "12px", marginBottom: "16px" }}
