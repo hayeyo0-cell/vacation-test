@@ -148,7 +148,7 @@ function fetchEmployees() {
 /* ------------------------------------------------------------------ */
 /* 로컬 저장소 헬퍼 (PIN은 기기에만 저장)                                */
 /* ------------------------------------------------------------------ */
-const STORAGE_KEY = "vacation_auth";
+const STORAGE_KEY = "vacation_auth" + (window.APP_STORAGE_SUFFIX || "");
 
 function saveLocalAuth(list) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
