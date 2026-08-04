@@ -694,12 +694,6 @@ function App() {
     setStep("chooseBranch");
   };
 
-  // 전체관리자(고스트모드) 전용 - 이 기기에 이미 등록된 다른 소속 계정으로, PIN 재입력 없이 바로 전환
-  const handleQuickSwitch = (auth) => {
-    setLoginTarget(auth);
-    setStep("main");
-  };
-
   /* ------------------------------ 화면 렌더링 ------------------------------ */
 
   if (step === "loading") {
@@ -926,8 +920,6 @@ function App() {
         currentUser={loginTarget || { ...selectedEmp }}
         employees={employees}
         managers={managers}
-        localAuth={localAuth}
-        onQuickSwitch={handleQuickSwitch}
         onSwitchUser={() => setStep("loginName")}
       />
     );
@@ -1406,13 +1398,14 @@ const tbl = {
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
-function MainScreen({ currentUser, employees, managers, localAuth, onQuickSwitch, onSwitchUser }) {
+function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitchUser }) {
+  const isSuperAdmin = isSuperAdminUser(realCurrentUser); // 나중에 경산·문양 둘 다 자리잡으면 이 개념 자체를 없애도 돼요
+  // 전체관리자 전용 - 실제 로그인/등록은 그대로 두고, 화면에 표시할 소속만 가상으로 바꿔치기 (Firestore 등록 불필요)
+  const otherBranch = realCurrentUser.branch === "경산" ? "문양" : "경산";
+  const [ghosting, setGhosting] = useState(false);
+  const currentUser =
+    isSuperAdmin && ghosting ? { ...realCurrentUser, branch: otherBranch } : realCurrentUser;
   const isAdmin = isAdminUser(currentUser);
-  const isSuperAdmin = isSuperAdminUser(currentUser); // 나중에 경산·문양 둘 다 자리잡으면 이 개념 자체를 없애도 돼요
-  // 전체관리자가 이 기기에 다른 소속 계정도 등록해뒀다면, PIN 재입력 없이 그 계정으로 바로 전환할 수 있어요
-  const otherBranchAuth = isSuperAdmin
-    ? (localAuth || []).find((a) => a.branch !== currentUser.branch)
-    : null;
   const isMidManager = isMidManagerUser(currentUser, managers);
   const [showAdmin, setShowAdmin] = useState(false);
   const [showManagerAdmin, setShowManagerAdmin] = useState(false);
@@ -2336,19 +2329,19 @@ function MainScreen({ currentUser, employees, managers, localAuth, onQuickSwitch
             )}
           </div>
           <div style={cal.headerBtnRow}>
-            {currentUser.branch === "경산" && !isMidManager && (
+            {currentUser.branch === "경산" && !isMidManager && !ghosting && (
               <a href={BAND_URL} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "none" }}>
                 <button style={adminStyles.bandBtn} type="button">
                   💬 밴드
                 </button>
               </a>
             )}
-            {!isMidManager && (
+            {!isMidManager && !ghosting && (
               <button style={adminStyles.adminBtn} onClick={() => openPanel(setShowMyVacations)}>
                 내 휴가현황
               </button>
             )}
-            {!isMidManager && (
+            {!isMidManager && !ghosting && (
               <button style={adminStyles.adminBtn} onClick={() => openPanel(setShowLotteryApply)}>
                 🎋 명절 응모
               </button>
@@ -2358,12 +2351,12 @@ function MainScreen({ currentUser, employees, managers, localAuth, onQuickSwitch
                 ⚙️ 관리자 메뉴
               </button>
             )}
-            {otherBranchAuth && (
+            {isSuperAdmin && (
               <button
                 style={{ ...adminStyles.adminBtn, background: "#7a4fd1", color: "#fff", borderColor: "#7a4fd1" }}
-                onClick={() => onQuickSwitch(otherBranchAuth)}
+                onClick={() => setGhosting((v) => !v)}
               >
-                🔀 {otherBranchAuth.branch}로 전환
+                {ghosting ? `🔀 ${realCurrentUser.branch}로 복귀` : `🔀 ${otherBranch}로 전환`}
               </button>
             )}
           </div>
@@ -2942,7 +2935,7 @@ function MainScreen({ currentUser, employees, managers, localAuth, onQuickSwitch
                   </div>
                 )}
 
-                {!isMidManager && (
+                {!isMidManager && !ghosting && (
                   dayRecords.some((v) => v.employeeId === currentUser.id && v.status !== "취소됨") ? (
                     <div style={{ textAlign: "center", color: "#999", fontSize: "13px", padding: "10px 0" }}>
                       이미 이 날짜에 신청하셨어요
@@ -2956,6 +2949,11 @@ function MainScreen({ currentUser, employees, managers, localAuth, onQuickSwitch
                       + 휴가 신청
                     </button>
                   )
+                )}
+                {ghosting && !isMidManager && (
+                  <div style={{ textAlign: "center", color: "#7a4fd1", fontSize: "12px", padding: "6px 0" }}>
+                    🔀 {otherBranch} 보기 전용 모드 - 신청은 비활성화돼요
+                  </div>
                 )}
                 {isMidManager && (
                   <button style={{ ...modal.addBtn, background: "#1a73e8" }} onClick={openManagerForm}>
@@ -3309,7 +3307,8 @@ const adminStyles = {
     alignItems: "center",
     gap: "3px",
   },
-};function MyVacationsPanel({ currentUser, onClose, employees }) {
+};
+function MyVacationsPanel({ currentUser, onClose, employees }) {
   const [list, setList] = useState([]);
   const [yearStats, setYearStats] = useState([]); // 올해 종류별 보장휴가 사용 개수
   const [loading, setLoading] = useState(true);
@@ -5043,4 +5042,3 @@ function ImportTestPanel({ onClose, employees, managers }) {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-
