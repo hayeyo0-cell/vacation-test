@@ -3019,7 +3019,7 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
         </div>
       )}
 
-      {showAdmin && <AdminPanel onClose={closeModal} employees={employees} managers={managers} />}
+      {showAdmin && <AdminPanel branch={currentUser.branch} onClose={closeModal} employees={employees} managers={managers} />}
       {showManagerAdmin && (
         <ManagerAdminPanel branch={currentUser.branch} onClose={closeModal} />
       )}
@@ -4279,7 +4279,7 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
   );
 }
 
-function AdminPanel({ onClose, employees, managers }) {
+function AdminPanel({ branch, onClose, employees, managers }) {
   const [tab, setTab] = useState("pending"); // "pending" | "approved"
   const [pending, setPending] = useState([]);
   const [approved, setApproved] = useState([]);
@@ -4290,8 +4290,8 @@ function AdminPanel({ onClose, employees, managers }) {
     waitForFirestore()
       .then(() => Promise.all([window.ApprovalAPI.listPending(), window.ApprovalAPI.listApproved()]))
       .then(([pendingList, approvedList]) => {
-        setPending(pendingList);
-        setApproved(approvedList);
+        setPending((pendingList || []).filter((p) => p.branch === branch));
+        setApproved((approvedList || []).filter((p) => p.branch === branch));
       })
       .catch((err) => alert("불러오기 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setLoading(false));
@@ -4358,6 +4358,7 @@ function AdminPanel({ onClose, employees, managers }) {
   return (
     <div style={modal.overlay} onClick={onClose}>
       <div style={modal.sheet} onClick={(e) => e.stopPropagation()}>
+        <div style={{ ...modal.dateTitle, marginBottom: "10px" }}>{branch} 승인 관리</div>
         <div style={{ display: "flex", gap: "6px", marginBottom: "14px" }}>
           <button
             style={tab === "pending" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
