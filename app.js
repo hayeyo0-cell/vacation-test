@@ -1400,6 +1400,7 @@ function pad2(n) {
 }
 function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
   const isAdmin = isAdminUser(currentUser);
+  const isSuperAdmin = isSuperAdminUser(currentUser); // 나중에 경산·문양 둘 다 자리잡으면 이 개념 자체를 없애도 돼요
   const isMidManager = isMidManagerUser(currentUser, managers);
   const [showAdmin, setShowAdmin] = useState(false);
   const [showManagerAdmin, setShowManagerAdmin] = useState(false);
@@ -3019,15 +3020,15 @@ function MainScreen({ currentUser, employees, managers, onSwitchUser }) {
         </div>
       )}
 
-      {showAdmin && <AdminPanel branch={currentUser.branch} onClose={closeModal} employees={employees} managers={managers} />}
+      {showAdmin && <AdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} employees={employees} managers={managers} />}
       {showManagerAdmin && (
-        <ManagerAdminPanel branch={currentUser.branch} onClose={closeModal} />
+        <ManagerAdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} />
       )}
       {showMyVacations && (
         <MyVacationsPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
       )}
       {showLotteryAdmin && (
-        <LotteryAdminPanel branch={currentUser.branch} onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
+        <LotteryAdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
       )}
       {showLotteryApply && (
         <LotteryApplyPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
@@ -3205,6 +3206,14 @@ const ADMIN_NAMES = [
 function isAdminUser(user) {
   if (!user) return false;
   return ADMIN_NAMES.some((a) => a.name === user.name && a.branch === user.branch);
+}
+
+// 전체관리자(앱 총괄) - 소속과 무관하게 모든 소속의 승인관리·운용인원·명절추첨을 볼 수 있어요.
+// 로그인은 평소처럼 한 소속으로 하되, 관리 화면 안에서 소속을 전환(고스트 모드)할 수 있어요.
+const SUPER_ADMIN_NAMES = ["권재림"];
+function isSuperAdminUser(user) {
+  if (!user) return false;
+  return SUPER_ADMIN_NAMES.includes(user.name);
 }
 
 const adminStyles = {
@@ -3861,7 +3870,8 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
 /* ------------------------------------------------------------------ */
 /* 명절 연휴 추첨 - 관리자 패널 (경산 전용)                              */
 /* ------------------------------------------------------------------ */
-function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet }) {
+function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers, holidaySet }) {
+  const [viewBranch, setViewBranch] = useState(branch); // 전체관리자만 전환 가능, 그 외엔 항상 본인 소속
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [entriesByEvent, setEntriesByEvent] = useState({}); // { [eventId]: entries[] }
@@ -3883,7 +3893,7 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
     waitForFirestore()
       .then(() => window.LotteryAPI.listEvents())
       .then((list) => {
-        const branchList = (list || []).filter((e) => e.branch === branch);
+        const branchList = (list || []).filter((e) => e.branch === viewBranch);
         setEvents(branchList);
         return Promise.all(
           branchList.map((e) =>
@@ -3904,7 +3914,7 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
 
   useEffect(() => {
     load();
-  }, []);
+  }, [viewBranch]);
 
   const handleAddDate = () => {
     if (!dateInput) return;
@@ -3937,7 +3947,7 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
     }
     setSaving(true);
     window.LotteryAPI.createEvent({
-      branch,
+      branch: viewBranch,
       holidayName,
       year: parseInt(year, 10),
       dates: newDates,
@@ -4098,7 +4108,23 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
     <div style={modal.overlay} onClick={onClose}>
       <div style={modal.sheet} onClick={(e) => e.stopPropagation()}>
         <div style={modal.dateTitle}>🎋 명절 연휴 추첨 관리</div>
-        <div style={{ ...modal.countText, marginBottom: "14px" }}>{branch} 전용 화면이에요</div>
+        {isSuperAdmin && (
+          <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+            <button
+              style={viewBranch === "경산" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
+              onClick={() => setViewBranch("경산")}
+            >
+              경산
+            </button>
+            <button
+              style={viewBranch === "문양" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
+              onClick={() => setViewBranch("문양")}
+            >
+              문양
+            </button>
+          </div>
+        )}
+        <div style={{ ...modal.countText, marginBottom: "14px" }}>{viewBranch} 전용 화면이에요</div>
 
         <button
           style={{ ...adminStyles.approveBtn, width: "100%", padding: "12px", marginBottom: "16px" }}
@@ -4279,8 +4305,9 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
   );
 }
 
-function AdminPanel({ branch, onClose, employees, managers }) {
+function AdminPanel({ branch, isSuperAdmin, onClose, employees, managers }) {
   const [tab, setTab] = useState("pending"); // "pending" | "approved"
+  const [viewBranch, setViewBranch] = useState(branch); // 전체관리자만 전환 가능, 그 외엔 항상 본인 소속
   const [pending, setPending] = useState([]);
   const [approved, setApproved] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -4290,8 +4317,8 @@ function AdminPanel({ branch, onClose, employees, managers }) {
     waitForFirestore()
       .then(() => Promise.all([window.ApprovalAPI.listPending(), window.ApprovalAPI.listApproved()]))
       .then(([pendingList, approvedList]) => {
-        setPending((pendingList || []).filter((p) => p.branch === branch));
-        setApproved((approvedList || []).filter((p) => p.branch === branch));
+        setPending((pendingList || []).filter((p) => p.branch === viewBranch));
+        setApproved((approvedList || []).filter((p) => p.branch === viewBranch));
       })
       .catch((err) => alert("불러오기 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setLoading(false));
@@ -4299,7 +4326,7 @@ function AdminPanel({ branch, onClose, employees, managers }) {
 
   useEffect(() => {
     load();
-  }, []);
+  }, [viewBranch]);
 
   const handleAction = (id, status) => {
     window.ApprovalAPI.setStatus(id, status).then(() => {
@@ -4358,7 +4385,23 @@ function AdminPanel({ branch, onClose, employees, managers }) {
   return (
     <div style={modal.overlay} onClick={onClose}>
       <div style={modal.sheet} onClick={(e) => e.stopPropagation()}>
-        <div style={{ ...modal.dateTitle, marginBottom: "10px" }}>{branch} 승인 관리</div>
+        <div style={{ ...modal.dateTitle, marginBottom: "10px" }}>{viewBranch} 승인 관리</div>
+        {isSuperAdmin && (
+          <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+            <button
+              style={viewBranch === "경산" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
+              onClick={() => setViewBranch("경산")}
+            >
+              경산
+            </button>
+            <button
+              style={viewBranch === "문양" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
+              onClick={() => setViewBranch("문양")}
+            >
+              문양
+            </button>
+          </div>
+        )}
         <div style={{ display: "flex", gap: "6px", marginBottom: "14px" }}>
           <button
             style={tab === "pending" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
@@ -4460,7 +4503,8 @@ function AdminPanel({ branch, onClose, employees, managers }) {
 /* ------------------------------------------------------------------ */
 /* 운용(중간관리자) 인원 관리 패널 (관리자 전용)                          */
 /* ------------------------------------------------------------------ */
-function ManagerAdminPanel({ branch, onClose }) {
+function ManagerAdminPanel({ branch, isSuperAdmin, onClose }) {
+  const [viewBranch, setViewBranch] = useState(branch); // 전체관리자만 전환 가능, 그 외엔 항상 본인 소속
   const [list, setList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [newName, setNewName] = useState("");
@@ -4470,14 +4514,14 @@ function ManagerAdminPanel({ branch, onClose }) {
     setLoading(true);
     waitForFirestore()
       .then(() => window.ManagerAPI.list())
-      .then((data) => setList(data.filter((m) => m.branch === branch)))
+      .then((data) => setList(data.filter((m) => m.branch === viewBranch)))
       .catch((err) => alert("불러오기 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
     load();
-  }, []);
+  }, [viewBranch]);
 
   const handleAdd = () => {
     const name = newName.trim();
@@ -4485,12 +4529,12 @@ function ManagerAdminPanel({ branch, onClose }) {
       alert("이름을 입력해주세요");
       return;
     }
-    if (list.some((m) => m.name === name && m.branch === branch)) {
+    if (list.some((m) => m.name === name && m.branch === viewBranch)) {
       alert("이미 등록된 이름이에요");
       return;
     }
     setSaving(true);
-    window.ManagerAPI.add({ name, branch })
+    window.ManagerAPI.add({ name, branch: viewBranch })
       .then(() => {
         setNewName("");
         load();
@@ -4509,9 +4553,25 @@ function ManagerAdminPanel({ branch, onClose }) {
   return (
     <div style={modal.overlay} onClick={onClose}>
       <div style={modal.sheet} onClick={(e) => e.stopPropagation()}>
-        <div style={modal.dateTitle}>{branch} 운용 인원 관리</div>
+        <div style={modal.dateTitle}>{viewBranch} 운용 인원 관리</div>
+        {isSuperAdmin && (
+          <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+            <button
+              style={viewBranch === "경산" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
+              onClick={() => setViewBranch("경산")}
+            >
+              경산
+            </button>
+            <button
+              style={viewBranch === "문양" ? adminStyles.tabBtnActive : adminStyles.tabBtn}
+              onClick={() => setViewBranch("문양")}
+            >
+              문양
+            </button>
+          </div>
+        )}
         <div style={{ ...modal.countText, marginBottom: "12px" }}>
-          인사이동으로 인원이 바뀌면 여기서 바로 추가/삭제하면 돼요 ({branch} 소속만 관리해요)
+          인사이동으로 인원이 바뀌면 여기서 바로 추가/삭제하면 돼요 ({viewBranch} 소속만 관리해요)
         </div>
 
         <div style={{ display: "flex", gap: "6px", marginBottom: "16px" }}>
