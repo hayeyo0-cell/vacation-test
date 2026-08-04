@@ -4463,14 +4463,13 @@ function ManagerAdminPanel({ branch, onClose }) {
   const [list, setList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [newName, setNewName] = useState("");
-  const [newBranch, setNewBranch] = useState(branch || "경산");
   const [saving, setSaving] = useState(false);
 
   const load = () => {
     setLoading(true);
     waitForFirestore()
       .then(() => window.ManagerAPI.list())
-      .then((data) => setList(data))
+      .then((data) => setList(data.filter((m) => m.branch === branch)))
       .catch((err) => alert("불러오기 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setLoading(false));
   };
@@ -4485,12 +4484,12 @@ function ManagerAdminPanel({ branch, onClose }) {
       alert("이름을 입력해주세요");
       return;
     }
-    if (list.some((m) => m.name === name && m.branch === newBranch)) {
+    if (list.some((m) => m.name === name && m.branch === branch)) {
       alert("이미 등록된 이름이에요");
       return;
     }
     setSaving(true);
-    window.ManagerAPI.add({ name, branch: newBranch })
+    window.ManagerAPI.add({ name, branch })
       .then(() => {
         setNewName("");
         load();
@@ -4509,20 +4508,12 @@ function ManagerAdminPanel({ branch, onClose }) {
   return (
     <div style={modal.overlay} onClick={onClose}>
       <div style={modal.sheet} onClick={(e) => e.stopPropagation()}>
-        <div style={modal.dateTitle}>운용 인원 관리</div>
+        <div style={modal.dateTitle}>{branch} 운용 인원 관리</div>
         <div style={{ ...modal.countText, marginBottom: "12px" }}>
-          인사이동으로 인원이 바뀌면 여기서 바로 추가/삭제하면 돼요
+          인사이동으로 인원이 바뀌면 여기서 바로 추가/삭제하면 돼요 ({branch} 소속만 관리해요)
         </div>
 
         <div style={{ display: "flex", gap: "6px", marginBottom: "16px" }}>
-          <select
-            style={{ ...styles.select, flex: "0 0 90px", marginBottom: 0 }}
-            value={newBranch}
-            onChange={(e) => setNewBranch(e.target.value)}
-          >
-            <option value="경산">경산</option>
-            <option value="문양">문양</option>
-          </select>
           <input
             style={{ ...styles.select, flex: 1, marginBottom: 0 }}
             placeholder="이름 입력"
