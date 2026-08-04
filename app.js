@@ -304,6 +304,19 @@ function PinPad({ length = 4, onComplete, error }) {
 
   const backspace = () => setPin(pin.slice(0, -1));
 
+  // PC에서 마우스로 숫자 버튼을 누르는 것 외에, 키보드 숫자키(0~9)와 백스페이스로도 입력할 수 있게
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key >= "0" && e.key <= "9") {
+        press(e.key);
+      } else if (e.key === "Backspace") {
+        backspace();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [pin, length]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
       <div style={styles.pinDots}>
@@ -3572,10 +3585,68 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
       .finally(() => setSaving(false));
   };
 
-  const handleCancelApply = (entry) => {
-    if (!confirm(`${entry.date} 응모를 취소할까요?`)) return;
+  // 야간(2일 연계) 응모 - 첫날+다음날을 하나로 묶어서 응모. 추첨 때 둘 다 당첨돼야 확정되고,
+  // 하나만 당첨되는 경우는 없도록(둘 다 낙첨 처리) 관리자 패널에서 처리해요.
+  const handleApplyLinked = (event, date, nextDate) => {
+    const state = formState[date] || {};
+    if (!state.type) {
+      alert("1일차 휴가 종류를 선택해주세요");
+      return;
+    }
+    const dia = (state.dia && state.dia.trim()) || codeForDate(date);
+    if (!dia) {
+      alert("1일차 DIA를 입력해주세요");
+      return;
+    }
+    if (!state.nextType) {
+      alert("2일차 휴가 종류를 선택해주세요");
+      return;
+    }
+    const nextDia = (state.nextDia && state.nextDia.trim()) || codeForDate(nextDate);
+    if (!nextDia) {
+      alert("2일차 DIA를 입력해주세요");
+      return;
+    }
+    const linkId = `${event.id}_${currentUser.id}_night_${date}`;
+    const entryId1 = `${event.id}_${currentUser.id}_${date}`;
+    const entryId2 = `${event.id}_${currentUser.id}_${nextDate}`;
     setSaving(true);
-    window.LotteryAPI.cancelApply(entry.id)
+    Promise.all([
+      window.LotteryAPI.apply(entryId1, {
+        eventId: event.id,
+        employeeId: currentUser.id,
+        name: currentUser.name,
+        branch: currentUser.branch,
+        date,
+        vacationType: state.type,
+        dia,
+        linkId,
+      }),
+      window.LotteryAPI.apply(entryId2, {
+        eventId: event.id,
+        employeeId: currentUser.id,
+        name: currentUser.name,
+        branch: currentUser.branch,
+        date: nextDate,
+        vacationType: state.nextType,
+        dia: nextDia,
+        linkId,
+      }),
+    ])
+      .then(() => load())
+      .catch((err) => alert("응모 실패: " + (err && err.message ? err.message : err)))
+      .finally(() => setSaving(false));
+  };
+
+  const handleCancelApply = (entry) => {
+    const isLinked = !!entry.linkId;
+    if (!confirm(isLinked ? `${entry.date} 야간 연계 응모(2일 모두)를 취소할까요?` : `${entry.date} 응모를 취소할까요?`))
+      return;
+    setSaving(true);
+    const paired = isLinked ? myEntries.find((en) => en.linkId === entry.linkId && en.id !== entry.id) : null;
+    const tasks = [window.LotteryAPI.cancelApply(entry.id)];
+    if (paired) tasks.push(window.LotteryAPI.cancelApply(paired.id));
+    Promise.all(tasks)
       .then(() => load())
       .catch((err) => alert("취소 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setSaving(false));
@@ -3627,6 +3698,9 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
               {(event.dates || []).map((dateInfo) => {
                 const date = dateInfo.date;
                 const entry = entryFor(event.id, date);
+                const nextDateInfo = (event.dates || []).find((d) => diffDays_(date, d.date) === 1);
+                const canLinkNight = !entry && !!nextDateInfo && !entryFor(event.id, nextDateInfo.date);
+                const st = formState[date] || {};
                 return (
                   <div key={date} style={{ ...modal.card, flexDirection: "column", alignItems: "stretch" }}>
                     <div style={{ fontWeight: 700, marginBottom: "6px" }}>
@@ -3636,6 +3710,7 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                         <div style={{ fontSize: "13px" }}>
                           {entry.vacationType} · {entry.dia}
+                          {entry.linkId && <span style={{ color: "#7a4fd1", fontWeight: 700 }}> · 🌙연계(2일)</span>}
                           {entry.result === "대기중" && <span style={{ color: "#e08a20" }}> · 응모완료(추첨 대기)</span>}
                           {entry.result === "당첨" && <span style={{ color: "#1caa5c" }}> · ✅당첨</span>}
                           {entry.result === "낙첨" && <span style={{ color: "#e02020" }}> · 낙첨</span>}
@@ -3647,39 +3722,98 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
                         )}
                       </div>
                     ) : (
-                      <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                        <select
-                          style={{ ...styles.select, flex: 1, marginBottom: 0 }}
-                          value={(formState[date] && formState[date].type) || ""}
-                          onChange={(e) =>
-                            setFormState((prev) => ({ ...prev, [date]: { ...prev[date], type: e.target.value } }))
-                          }
-                        >
-                          <option value="">휴가종류</option>
-                          {CAPACITY_TYPES.map((t) => (
-                            <option key={t} value={t}>{t}</option>
-                          ))}
-                        </select>
-                        <input
-                          style={{ ...styles.select, flex: "0 0 90px", marginBottom: 0 }}
-                          placeholder="DIA"
-                          value={
-                            formState[date] && formState[date].dia !== undefined
-                              ? formState[date].dia
-                              : codeForDate(date)
-                          }
-                          onChange={(e) =>
-                            setFormState((prev) => ({ ...prev, [date]: { ...prev[date], dia: e.target.value } }))
-                          }
-                        />
-                        <button
-                          style={{ ...adminStyles.approveBtn, flexShrink: 0 }}
-                          disabled={saving}
-                          onClick={() => handleApply(event, date)}
-                        >
-                          응모
-                        </button>
-                      </div>
+                      <React.Fragment>
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                          <select
+                            style={{ ...styles.select, flex: 1, marginBottom: 0 }}
+                            value={(formState[date] && formState[date].type) || ""}
+                            onChange={(e) =>
+                              setFormState((prev) => ({ ...prev, [date]: { ...prev[date], type: e.target.value } }))
+                            }
+                          >
+                            <option value="">휴가종류</option>
+                            {CAPACITY_TYPES.map((t) => (
+                              <option key={t} value={t}>{t}</option>
+                            ))}
+                          </select>
+                          <input
+                            style={{ ...styles.select, flex: "0 0 90px", marginBottom: 0 }}
+                            placeholder="DIA"
+                            value={
+                              formState[date] && formState[date].dia !== undefined
+                                ? formState[date].dia
+                                : codeForDate(date)
+                            }
+                            onChange={(e) =>
+                              setFormState((prev) => ({ ...prev, [date]: { ...prev[date], dia: e.target.value } }))
+                            }
+                          />
+                          {!st.linkNext && (
+                            <button
+                              style={{ ...adminStyles.approveBtn, flexShrink: 0 }}
+                              disabled={saving}
+                              onClick={() => handleApply(event, date)}
+                            >
+                              응모
+                            </button>
+                          )}
+                        </div>
+                        {canLinkNight && (
+                          <label
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                              marginTop: "8px",
+                              fontSize: "12px",
+                              color: "#7a4fd1",
+                              fontWeight: 600,
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={!!st.linkNext}
+                              onChange={(e) =>
+                                setFormState((prev) => ({ ...prev, [date]: { ...prev[date], linkNext: e.target.checked } }))
+                              }
+                            />
+                            🌙 다음날({nextDateInfo.date})과 연계된 야간 신청 (이틀 모두 당첨돼야 확정, 하나만 당첨되지 않아요)
+                          </label>
+                        )}
+                        {canLinkNight && st.linkNext && (
+                          <div style={{ display: "flex", gap: "6px", alignItems: "center", marginTop: "8px" }}>
+                            <select
+                              style={{ ...styles.select, flex: 1, marginBottom: 0 }}
+                              value={st.nextType || ""}
+                              onChange={(e) =>
+                                setFormState((prev) => ({ ...prev, [date]: { ...prev[date], nextType: e.target.value } }))
+                              }
+                            >
+                              <option value="">2일차 휴가종류</option>
+                              {CAPACITY_TYPES.map((t) => (
+                                <option key={t} value={t}>{t}</option>
+                              ))}
+                            </select>
+                            <input
+                              style={{ ...styles.select, flex: "0 0 90px", marginBottom: 0 }}
+                              placeholder="2일차 DIA"
+                              value={
+                                st.nextDia !== undefined ? st.nextDia : codeForDate(nextDateInfo.date)
+                              }
+                              onChange={(e) =>
+                                setFormState((prev) => ({ ...prev, [date]: { ...prev[date], nextDia: e.target.value } }))
+                              }
+                            />
+                            <button
+                              style={{ ...adminStyles.approveBtn, flexShrink: 0, background: "#7a4fd1" }}
+                              disabled={saving}
+                              onClick={() => handleApplyLinked(event, date, nextDateInfo.date)}
+                            >
+                              2일 연계 응모
+                            </button>
+                          </div>
+                        )}
+                      </React.Fragment>
                     )}
                   </div>
                 );
@@ -3699,7 +3833,10 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
                   <div key={en.id} style={modal.card}>
                     <div>
                       <div style={modal.name}>{event.year}년 {event.holidayName} · {en.date}</div>
-                      <div style={modal.typeRow}>{en.vacationType} · {en.dia}</div>
+                      <div style={modal.typeRow}>
+                        {en.vacationType} · {en.dia}
+                        {en.linkId && <span style={{ color: "#7a4fd1", fontWeight: 700 }}> · 🌙연계</span>}
+                      </div>
                     </div>
                     <div
                       style={{
@@ -3844,56 +3981,105 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
     try {
       const entries = (entriesByEvent[event.id] || []).filter((en) => en.result === "대기중");
 
-      let totalWinners = 0;
-      let totalLosers = 0;
-
+      // 1) 날짜별 현재 여유 인원(정원) 계산 + 그 날짜 응모자를 무작위 순서로 섞어서 대기열 구성
+      const capacityLeft = {};
+      const activeCapacityCountByDate = {};
+      const candidatesByDate = {};
+      const cursorByDate = {};
+      const winnerSetByDate = {};
       for (const dateInfo of event.dates) {
         const date = dateInfo.date;
-        const dateEntries = entries.filter((en) => en.date === date);
-        if (dateEntries.length === 0) continue;
-
         const existing = await window.VacationAPI.getByDate(date);
         const activeExisting = existing.filter((v) => v.branch === event.branch && v.status !== "취소됨");
         const activeCapacityCount = activeExisting.filter((v) => isCapacityType(v.vacationType)).length;
+        activeCapacityCountByDate[date] = activeCapacityCount;
         // 명절은 특수 상황이 많아서, 자동 계산 대신 관리자가 그 날짜에 직접 지정한 인원을 그대로 써요
-        const capacity = dateInfo.capacity;
-        const remaining = Math.max(0, capacity - activeCapacityCount);
+        capacityLeft[date] = Math.max(0, dateInfo.capacity - activeCapacityCount);
+        candidatesByDate[date] = entries.filter((en) => en.date === date).sort(() => Math.random() - 0.5);
+        cursorByDate[date] = 0;
+        winnerSetByDate[date] = new Set();
+      }
 
-        let winners = [];
-        if (dateEntries.length <= remaining) {
-          winners = dateEntries;
-        } else {
-          const shuffled = [...dateEntries].sort(() => Math.random() - 0.5);
-          winners = shuffled.slice(0, remaining);
+      // 그 날짜 정원이 찰 때까지, 무작위로 섞인 대기열 순서대로 다음 사람을 당첨시켜요.
+      const fillDate = (date) => {
+        const candidates = candidatesByDate[date] || [];
+        const winnerSet = winnerSetByDate[date];
+        while (winnerSet.size < (capacityLeft[date] || 0) && cursorByDate[date] < candidates.length) {
+          winnerSet.add(candidates[cursorByDate[date]].id);
+          cursorByDate[date] += 1;
         }
-        const winnerIdSet = new Set(winners.map((w) => w.id));
-        // 당첨자는 신청순서(먼저 응모한 사람 먼저)대로 순번 부여 - 기존 보장인원 수 다음 번호부터 이어서
-        const winnersSorted = [...winners].sort(
+      };
+
+      // 2) 1차로 모든 날짜를 각자 독립적으로(그 날짜 응모자들끼리만 경쟁) 추첨
+      for (const dateInfo of event.dates) fillDate(dateInfo.date);
+
+      // 3) 야간(2일 연계) 응모 검증 - 두 날짜 다 당첨이면 그대로 확정, 한쪽만 당첨이면 둘 다 낙첨시키고
+      //    그 자리는 해당 날짜의 다음 대기자에게 자동으로 넘어가요(fillDate 재호출). 승격된 사람이 또 다른
+      //    연계의 절반이면 다시 검증하는 식으로, 더 이상 바뀌는 게 없을 때까지 반복해요.
+      const pairs = [];
+      const seenLinkIds = new Set();
+      entries.forEach((en) => {
+        if (!en.linkId || seenLinkIds.has(en.linkId)) return;
+        const partner = entries.find((e2) => e2.linkId === en.linkId && e2.id !== en.id);
+        if (partner) {
+          pairs.push({ a: en, b: partner });
+          seenLinkIds.add(en.linkId);
+        }
+      });
+
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const pair of pairs) {
+          const aWin = winnerSetByDate[pair.a.date].has(pair.a.id);
+          const bWin = winnerSetByDate[pair.b.date].has(pair.b.id);
+          if (aWin !== bWin) {
+            // 한쪽만 당첨된 상태 - 야간연계는 하나만 당첨될 수 없으므로 둘 다 낙첨 처리
+            if (aWin) winnerSetByDate[pair.a.date].delete(pair.a.id);
+            if (bWin) winnerSetByDate[pair.b.date].delete(pair.b.id);
+            changed = true;
+          }
+        }
+        if (changed) {
+          for (const dateInfo of event.dates) fillDate(dateInfo.date);
+        }
+      }
+
+      // 4) 당첨자 순번(priority)은 날짜별로, 그 날짜에 최종 당첨된 사람들을 신청순서대로 매김
+      const priorityByEntryId = {};
+      for (const dateInfo of event.dates) {
+        const date = dateInfo.date;
+        const winners = (candidatesByDate[date] || []).filter((en) => winnerSetByDate[date].has(en.id));
+        const sorted = [...winners].sort(
           (a, b) => (a.appliedAt?.toMillis?.() || 0) - (b.appliedAt?.toMillis?.() || 0)
         );
-        const priorityByEntryId = {};
-        winnersSorted.forEach((w, idx) => {
-          priorityByEntryId[w.id] = activeCapacityCount + idx + 1;
+        const base = activeCapacityCountByDate[date] || 0;
+        sorted.forEach((en, idx) => {
+          priorityByEntryId[en.id] = base + idx + 1;
         });
+      }
 
-        for (const en of dateEntries) {
-          const isWinner = winnerIdSet.has(en.id);
-          await window.LotteryAPI.updateEntry(en.id, { result: isWinner ? "당첨" : "낙첨" });
-          if (isWinner) {
-            totalWinners += 1;
-            const docId = `${en.employeeId}_${en.date}`;
-            await window.VacationAPI.addOnce(docId, {
-              name: en.name,
-              branch: en.branch,
-              employeeId: en.employeeId,
-              vacationType: en.vacationType,
-              dia: en.dia,
-              date: en.date,
-              priority: priorityByEntryId[en.id],
-            });
-          } else {
-            totalLosers += 1;
-          }
+      // 5) 결과 반영
+      let totalWinners = 0;
+      let totalLosers = 0;
+
+      for (const en of entries) {
+        const isWinner = winnerSetByDate[en.date].has(en.id);
+        await window.LotteryAPI.updateEntry(en.id, { result: isWinner ? "당첨" : "낙첨" });
+        if (isWinner) {
+          const docId = `${en.employeeId}_${en.date}`;
+          await window.VacationAPI.addOnce(docId, {
+            name: en.name,
+            branch: en.branch,
+            employeeId: en.employeeId,
+            vacationType: en.vacationType,
+            dia: en.dia,
+            date: en.date,
+            priority: priorityByEntryId[en.id],
+          });
+          totalWinners += 1;
+        } else {
+          totalLosers += 1;
         }
       }
 
@@ -4049,6 +4235,7 @@ function LotteryAdminPanel({ branch, onClose, employees, managers, holidaySet })
                             {dateEntries.map((en) => (
                               <div key={en.id} style={{ fontSize: "11px", color: "#888" }}>
                                 · {en.name} ({en.vacationType}·{en.dia})
+                                {en.linkId && <span style={{ color: "#7a4fd1", fontWeight: 700 }}> 🌙연계</span>}
                                 {en.result === "당첨" && <span style={{ color: "#1caa5c", fontWeight: 700 }}> 당첨</span>}
                                 {en.result === "낙첨" && <span style={{ color: "#e02020" }}> 낙첨</span>}
                                 {en.result && en.result.startsWith("제외") && (
