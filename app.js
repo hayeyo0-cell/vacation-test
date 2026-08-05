@@ -1306,10 +1306,14 @@ function cancelNightPairIfAny(record, onPairCancelled) {
   }
   if (!pairDate) return Promise.resolve(null);
 
-  const pairId = `${record.employeeId}_${pairDate}`;
+  // 문서 ID를 추측하지 않고, 그 날짜 기록 중 같은 직원ID를 찾아요.
+  // (본인이 앱에서 직접 신청한 건 "직원ID_날짜" 고정ID지만, 가져오기/대신기록으로 들어온 건
+  //  Firestore가 임의로 만든 ID라서 ID 추측 방식으로는 못 찾기 때문)
   return window.VacationAPI.getByDate(pairDate)
     .then((records) => {
-      const pairRecord = (records || []).find((r) => r.id === pairId && r.status !== "취소됨");
+      const pairRecord = (records || []).find(
+        (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
+      );
       if (!pairRecord) return null;
       const valid = expectCompanion
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
@@ -1691,6 +1695,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   const [managerFormDia, setManagerFormDia] = useState("");
   const [managerFormNote, setManagerFormNote] = useState("");
   const [managerSaving, setManagerSaving] = useState(false);
+
   useEffect(() => {
     let cancelled = false;
     fetchHolidays(viewYear).then((set) => {
