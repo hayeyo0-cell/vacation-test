@@ -1268,6 +1268,64 @@ function isNightShiftCode(dia, branch) {
   return regex.test(String(dia || "").trim());
 }
 
+// 야간 근무 신청 시 자동으로 같이 등록/취소되는 "비번" 짝 - 휴가종류 매핑
+const NIGHT_COMPANION_TYPE_MAP = { 연차: "연차비", 분지: "분지비", 장재: "장재비" };
+const NIGHT_COMPANION_TYPES_REVERSE = Object.fromEntries(
+  Object.entries(NIGHT_COMPANION_TYPE_MAP).map(([parent, companion]) => [companion, parent])
+);
+
+// 오늘 야간 DIA → 다음날 비번 DIA로 변환. 끝이 "d"면 "~"로 바꾸고, 아니면 뒤에 "~"를 붙여요.
+// 예: 25d → 25~ / 대4 → 대4~ / 대6 → 대6~
+function nightDiaToOffDutyDia(dia) {
+  const trimmed = String(dia || "").trim();
+  if (/d$/.test(trimmed)) return trimmed.slice(0, -1) + "~";
+  return trimmed + "~";
+}
+
+// 날짜 문자열을 하루 앞/뒤로 이동
+function shiftDateStr_(dateStr, delta) {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + delta);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+// 야간+비번 짝 기록을 찾아서 반대쪽도 같이 취소해요 (한쪽을 취소하면 반대쪽도 자동 취소).
+// - record가 "야간"(연차/분지/장재 + 야간교번)이면 → 다음날 비번(연차비 등) 짝을 찾아 취소
+// - record가 "비번"(연차비 등, DIA 끝이 "~")이면 → 전날 야간 짝을 찾아 취소
+// onPairCancelled(pairRecord)는 짝이 실제로 취소됐을 때 호출되는 콜백 (화면 상태 갱신용).
+function cancelNightPairIfAny(record, onPairCancelled) {
+  const dia = String(record.dia || "").trim();
+  let pairDate = null;
+  let expectCompanion = null;
+  if (NIGHT_COMPANION_TYPE_MAP[record.vacationType] && isNightShiftCode(dia, record.branch)) {
+    pairDate = shiftDateStr_(record.date, 1);
+    expectCompanion = true;
+  } else if (NIGHT_COMPANION_TYPES_REVERSE[record.vacationType] && dia.endsWith("~")) {
+    pairDate = shiftDateStr_(record.date, -1);
+    expectCompanion = false;
+  }
+  if (!pairDate) return Promise.resolve(null);
+
+  const pairId = `${record.employeeId}_${pairDate}`;
+  return window.VacationAPI.getByDate(pairDate)
+    .then((records) => {
+      const pairRecord = (records || []).find((r) => r.id === pairId && r.status !== "취소됨");
+      if (!pairRecord) return null;
+      const valid = expectCompanion
+        ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
+        : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType] && isNightShiftCode(pairRecord.dia, pairRecord.branch);
+      if (!valid) return null;
+      return window.VacationAPI.cancel(pairRecord.id).then(() => {
+        if (onPairCancelled) onPairCancelled(pairRecord);
+        return pairRecord;
+      });
+    })
+    .catch((err) => {
+      console.error("야간 짝 취소 실패:", err);
+      return null;
+    });
+}
+
 // activeRecords: 취소 아닌 전체 기록 (비번 감지는 전체 기록 대상)
 // prevDayActiveRecords: 전날의 취소 아닌 전체 기록 (전날 야간 신청으로 인한 비번 자리 자동 오픈 판별용)
 // branch: "경산" | "문양"
@@ -1959,6 +2017,8 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         );
         return next;
       });
+      // 야간/비번 짝이 있으면 반대쪽도 같이 취소
+      cancelNightPairIfAny(record, () => loadMonth(viewYear, viewMonth));
     });
   };
 
@@ -2052,6 +2112,10 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
   const submitVacationRecord = (priority) => {
     const docId = `${currentUser.id}_${selectedDate}`; // 직원ID_날짜 고정 ID - 중복 신청 원천 차단
+    const companionType = NIGHT_COMPANION_TYPE_MAP[formType];
+    const shouldAddCompanion =
+      isNightFormEntry && companionType && nextDateStr && isCapacityType(formType);
+
     window.VacationAPI.addOnce(docId, {
       name: currentUser.name,
       branch: currentUser.branch,
@@ -2061,6 +2125,24 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       date: selectedDate,
       ...(priority != null ? { priority } : {}),
     })
+      .then(() => {
+        if (!shouldAddCompanion) return;
+        // 야간 신청이면 다음날 "비번" 기록도 같이 자동 등록해요 (연차→연차비, 분지→분지비, 장재→장재비)
+        const companionDocId = `${currentUser.id}_${nextDateStr}`;
+        return window.VacationAPI.addOnce(companionDocId, {
+          name: currentUser.name,
+          branch: currentUser.branch,
+          employeeId: currentUser.id,
+          vacationType: companionType,
+          dia: nightDiaToOffDutyDia(formDia.trim()),
+          date: nextDateStr,
+        }).catch((err) => {
+          console.error("비번 자동 등록 실패:", err);
+          alert(
+            "휴가는 저장됐지만, 다음날 비번 자동 등록에 실패했어요. 다음날에 직접 비번을 추가로 입력해주세요."
+          );
+        });
+      })
       .then(() => {
         setShowRegisterForm(false);
         setFormDia("");
@@ -2128,6 +2210,16 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
             setSaving(false);
             alert(
               `앗, 다음날(${nextDateStr})이 이미 다 차서 야간 신청을 저장할 수 없어요. 다른 날짜를 선택해주세요.`
+            );
+            loadMonth(viewYear, viewMonth);
+            setShowRegisterForm(false);
+            return;
+          }
+          // 다음날에 본인이 이미 다른 기록을 갖고 있으면, 비번 자동등록이 그 기록을 덮어쓸 수 있어 미리 막아요
+          if (NIGHT_COMPANION_TYPE_MAP[formType] && nextDayActive.some((v) => v.employeeId === currentUser.id)) {
+            setSaving(false);
+            alert(
+              `다음날(${nextDateStr})에 이미 본인 기록이 있어서 비번을 자동으로 넣을 수 없어요. 다음날 기록을 먼저 확인해주세요.`
             );
             loadMonth(viewYear, viewMonth);
             setShowRegisterForm(false);
@@ -3465,6 +3557,14 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
     if (!confirm(`${record.date} ${record.vacationType} 기록을 취소할까요?`)) return;
     window.VacationAPI.cancel(record.id).then(() => {
       setList((prev) => prev.map((v) => (v.id === record.id ? { ...v, status: "취소됨" } : v)));
+      // 야간/비번 짝이 있으면 반대쪽도 같이 취소 (이 목록에 있으면 화면도 같이 갱신)
+      cancelNightPairIfAny(record, (pairRecord) => {
+        setList((prev) =>
+          prev.some((v) => v.id === pairRecord.id)
+            ? prev.map((v) => (v.id === pairRecord.id ? { ...v, status: "취소됨" } : v))
+            : prev
+        );
+      });
     });
   };
 
