@@ -3067,12 +3067,14 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                                     취소
                                   </button>
                                 )}
-                                {!cancelled && isMidManager && v.employeeId !== currentUser.id && (
+                                {!cancelled && isMidManager && v.employeeId !== currentUser.id &&
+                                  (!v.recordedBy || isCapacityType(v.vacationType)) && (
                                   <button style={{ ...modal.smallCancelBtn, margin: 0 }} onClick={() => handleCancel(v)}>
                                     취소
                                   </button>
                                 )}
-                                {!cancelled && isMidManager && v.recordedBy === currentUser.name && (
+                                {!cancelled && isMidManager && v.recordedBy === currentUser.name &&
+                                  !isCapacityType(v.vacationType) && (
                                   <button
                                     style={{ ...modal.smallCancelBtn, color: "#e02020", margin: 0 }}
                                     onClick={() => handleAdminDelete(v)}
