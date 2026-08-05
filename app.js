@@ -1918,6 +1918,26 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       })()
     : null;
 
+  // 야간 근무 신청 시 - 다음날이 이미 꽉 차서 비번 자리를 못 받는 경우를 미리 확인 (경산·문양 공통)
+  const isNightFormEntry = selectedDate && isNightShiftCode(formDia, currentUser.branch);
+  const nightNextDayBlock =
+    isNightFormEntry && nextDateStr
+      ? (() => {
+          const nextDayActive = (monthMap[nextDateStr] || []).filter(
+            (v) => v.branch === currentUser.branch && v.status !== "취소됨"
+          );
+          const nextDayCapacityCount = nextDayActive.filter((v) => isCapacityType(v.vacationType)).length;
+          const nextDayCapacity = gyeongsanCapacity(
+            currentUser.branch,
+            nextDateStr,
+            nextDayActive,
+            holidaySet,
+            [{ dia: formDia }] // 지금 입력 중인 야간 신청 자체가 다음날 비번 자리를 열어주는 조건
+          );
+          return nextDayCapacityCount >= nextDayCapacity;
+        })()
+      : false;
+
   const handleSelfCancelClick = (record) => {
     const check = checkSelfCancelAllowed(currentUser.branch, record);
     if (!check.ok) {
@@ -2062,9 +2082,10 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         Promise.all([
           window.VacationAPI.getByDate(selectedDate),
           prevDateStr ? window.VacationAPI.getByDate(prevDateStr) : Promise.resolve([]),
+          isNightFormEntry && nextDateStr ? window.VacationAPI.getByDate(nextDateStr) : Promise.resolve([]),
         ])
       )
-      .then(([freshDayRecords, prevDayRecords]) => {
+      .then(([freshDayRecords, prevDayRecords, nextDayRecords]) => {
         const freshActive = (freshDayRecords || []).filter(
           (v) => v.branch === currentUser.branch && v.status !== "취소됨"
         );
@@ -2092,6 +2113,26 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
           loadMonth(viewYear, viewMonth); // 화면도 최신 상태로 갱신
           setShowRegisterForm(false);
           return;
+        }
+
+        // 야간 근무면 다음날 비번 자리가 실제로 남아있는지도 최신 데이터로 재확인
+        if (isNightFormEntry && nextDateStr) {
+          const nextDayActive = (nextDayRecords || []).filter(
+            (v) => v.branch === currentUser.branch && v.status !== "취소됨"
+          );
+          const nextDayCapacityCount = nextDayActive.filter((v) => isCapacityType(v.vacationType)).length;
+          const nextDayCapacity = gyeongsanCapacity(currentUser.branch, nextDateStr, nextDayActive, holidaySet, [
+            { dia: formDia },
+          ]);
+          if (nextDayCapacityCount >= nextDayCapacity) {
+            setSaving(false);
+            alert(
+              `앗, 다음날(${nextDateStr})이 이미 다 차서 야간 신청을 저장할 수 없어요. 다른 날짜를 선택해주세요.`
+            );
+            loadMonth(viewYear, viewMonth);
+            setShowRegisterForm(false);
+            return;
+          }
         }
 
         // 순번(짝수달 1일 선착순 신청용) - 그 날짜 보장휴가 기록 수(취소 포함) 다음 번호로 자동 부여
@@ -2705,9 +2746,14 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                         ⚠️ 이 교번은 3왕복이에요 - 가급적 휴가를 피해달라는 약속이 있어요 (부득이하면 그대로 신청하셔도 돼요)
                       </div>
                     )}
+                  {nightNextDayBlock && (
+                    <div style={{ fontSize: "12px", marginTop: "6px", color: "#e02020", fontWeight: 700 }}>
+                      🌙 야간 근무라 다음날({nextDateStr})이 비번으로 이어지는데, 다음날 자리가 이미 다 차서 신청할 수 없어요.
+                    </div>
+                  )}
                 </div>
 
-                <button style={modal.addBtn} onClick={handleSubmitRegister} disabled={saving}>
+                <button style={modal.addBtn} onClick={handleSubmitRegister} disabled={saving || nightNextDayBlock}>
                   {saving ? "저장 중..." : "저장"}
                 </button>
                 <button style={modal.closeBtn} onClick={() => setShowRegisterForm(false)}>취소</button>
