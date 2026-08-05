@@ -3062,7 +3062,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                                 )}
                               </td>
                               <td style={tbl.td}>
-                                {!cancelled && v.employeeId === currentUser.id && !v.confirmedBy && (
+                                {!cancelled && v.employeeId === currentUser.id && !v.confirmedBy && !v.recordedBy && (
                                   <button style={{ ...modal.smallCancelBtn, margin: 0 }} onClick={() => handleSelfCancelClick(v)}>
                                     취소
                                   </button>
@@ -3532,7 +3532,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
       .then((records) => {
         const today = todayStr();
         const upcoming = records
-          .filter((v) => v.date >= today)
+          .filter((v) => v.date >= today && isCapacityType(v.vacationType))
           .sort((a, b) => a.date.localeCompare(b.date));
         setList(upcoming);
 
@@ -3650,7 +3650,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
                   <div style={modal.name}>{v.date} ({weekdayShort(v.date)})</div>
                   <div style={{ display: "flex", alignItems: "center" }}>
                     <div style={modal.dia}>{v.dia}</div>
-                    {!cancelled && !v.confirmedBy && (
+                    {!cancelled && !v.confirmedBy && !v.recordedBy && (
                       <React.Fragment>
                         <button
                           style={{ ...modal.smallCancelBtn, color: "#1b3a5c" }}
