@@ -1255,13 +1255,30 @@ const GUARANTEE_BY_BRANCH = {
   문양: { 평일: 5, 토요일: 7, 휴일: 8 },
 };
 
+// 소속별 "야간" 근무 교번 - 다음날 자동으로 "비번"이 되는 근무.
+// 다음날 정원이 이미 다 찼어도, 전날 야간을 신청한 사람 몫으로 비번 자리가 자동으로 하나 열려야 해요.
+// 경산: 21~29d, 대4 / 문양: 24~34d, 대6
+const NIGHT_SHIFT_CODE_REGEX_BY_BRANCH = {
+  경산: /^(2[1-9]d|대4)$/,
+  문양: /^(2[4-9]d|3[0-4]d|대6)$/,
+};
+function isNightShiftCode(dia, branch) {
+  const regex = NIGHT_SHIFT_CODE_REGEX_BY_BRANCH[branch];
+  if (!regex) return false;
+  return regex.test(String(dia || "").trim());
+}
+
 // activeRecords: 취소 아닌 전체 기록 (비번 감지는 전체 기록 대상)
+// prevDayActiveRecords: 전날의 취소 아닌 전체 기록 (전날 야간 신청으로 인한 비번 자리 자동 오픈 판별용)
 // branch: "경산" | "문양"
-function gyeongsanCapacity(branch, dateStr, activeRecords, holidaySet) {
+// 참고: 오늘/전날의 요일(평일·토요일·휴일)은 각 날짜별로 실제 계산해서 정원표를 조회하기 때문에,
+// 평일→토요일, 토요일→휴일, 휴일→평일 등 요일이 바뀌는 경계에서도 별도 분기 없이 자동으로 맞게 처리돼요.
+function gyeongsanCapacity(branch, dateStr, activeRecords, holidaySet, prevDayActiveRecords) {
   const table = GUARANTEE_BY_BRANCH[branch] || GUARANTEE_BY_BRANCH["경산"];
   let base = table[getDayType(dateStr, holidaySet)];
-  const hasOffDuty = activeRecords.some((r) => (r.dia || "").includes("비번"));
-  if (hasOffDuty) base += 1;
+  const hasOffDutyToday = activeRecords.some((r) => (r.dia || "").includes("비번"));
+  const hasNightFromYesterday = (prevDayActiveRecords || []).some((r) => isNightShiftCode(r.dia, branch));
+  if (hasOffDutyToday || hasNightFromYesterday) base += 1;
   return base;
 }
 
@@ -1886,7 +1903,16 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
   const gyeongsanInfo = selectedDate
     ? (() => {
-        const capacity = gyeongsanCapacity(currentUser.branch, selectedDate, activeRecordsForCapacity, holidaySet);
+        const prevDayActive = (monthMap[prevDateStr] || []).filter(
+          (v) => v.branch === currentUser.branch && v.status !== "취소됨"
+        );
+        const capacity = gyeongsanCapacity(
+          currentUser.branch,
+          selectedDate,
+          activeRecordsForCapacity,
+          holidaySet,
+          prevDayActive
+        );
         const remain = capacity - capacityCount;
         return { capacity, remain, capacityCount };
       })()
@@ -2032,9 +2058,17 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     // 저장 시점에 그날의 최신 데이터로 중복신청 여부와 보장인원 정원을 다시 확인해요
     // (동시 신청으로 인한 중복/초과 방지).
     waitForFirestore()
-      .then(() => window.VacationAPI.getByDate(selectedDate))
-      .then((freshDayRecords) => {
+      .then(() =>
+        Promise.all([
+          window.VacationAPI.getByDate(selectedDate),
+          prevDateStr ? window.VacationAPI.getByDate(prevDateStr) : Promise.resolve([]),
+        ])
+      )
+      .then(([freshDayRecords, prevDayRecords]) => {
         const freshActive = (freshDayRecords || []).filter(
+          (v) => v.branch === currentUser.branch && v.status !== "취소됨"
+        );
+        const prevDayActive = (prevDayRecords || []).filter(
           (v) => v.branch === currentUser.branch && v.status !== "취소됨"
         );
 
@@ -2048,7 +2082,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         }
 
         const freshCapacityCount = freshActive.filter((v) => isCapacityType(v.vacationType)).length;
-        const capacity = gyeongsanCapacity(currentUser.branch, selectedDate, freshActive, holidaySet);
+        const capacity = gyeongsanCapacity(currentUser.branch, selectedDate, freshActive, holidaySet, prevDayActive);
 
         if (freshCapacityCount >= capacity) {
           setSaving(false);
@@ -2222,7 +2256,13 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     const branchRecords = sortRecordsForDisplay(records);
     const activeRecs = branchRecords.filter((v) => v.status !== "취소됨");
     const capacityActive = activeRecs.filter((v) => isCapacityType(v.vacationType));
-    const capacity = gyeongsanCapacity(currentUser.branch, dateStr, activeRecs, holidaySet);
+    const colPrevDate = new Date(dateStr + "T00:00:00");
+    colPrevDate.setDate(colPrevDate.getDate() - 1);
+    const colPrevKey = `${colPrevDate.getFullYear()}-${pad2(colPrevDate.getMonth() + 1)}-${pad2(colPrevDate.getDate())}`;
+    const colPrevActive = (monthMap[colPrevKey] || []).filter(
+      (v) => v.branch === currentUser.branch && v.status !== "취소됨"
+    );
+    const capacity = gyeongsanCapacity(currentUser.branch, dateStr, activeRecs, holidaySet, colPrevActive);
     return (
       <div
         style={{
@@ -2419,7 +2459,12 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
           const activeRecords = branchRecords.filter((v) => v.status !== "취소됨");
           const capacityCount = activeRecords.filter((v) => isCapacityType(v.vacationType)).length;
 
-          const capacity = gyeongsanCapacity(currentUser.branch, key, activeRecords, holidaySet);
+          const prevKeyDate = new Date(viewYear, viewMonth, d - 1);
+          const prevKey = `${prevKeyDate.getFullYear()}-${pad2(prevKeyDate.getMonth() + 1)}-${pad2(prevKeyDate.getDate())}`;
+          const prevDayActive = (monthMap[prevKey] || []).filter(
+            (v) => v.branch === currentUser.branch && v.status !== "취소됨"
+          );
+          const capacity = gyeongsanCapacity(currentUser.branch, key, activeRecords, holidaySet, prevDayActive);
           const remain = capacity - capacityCount;
           const badge = <div style={cal.dayBadge(gyeongsanColor(remain))}>{activeRecords.length}</div>;
 
