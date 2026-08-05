@@ -998,7 +998,7 @@ function checkSelfCancelAllowed(branch, record) {
   const vacDate = new Date(record.date + "T00:00:00");
   const todayDate = new Date(today + "T00:00:00");
   const diffDays = Math.round((vacDate - todayDate) / 86400000);
-  if (diffDays <= 6) {
+  if (diffDays <= 7) {
     return { ok: false, reason: "휴가일 기준 7일 전부터는 취소할 수 없어요 (경산 팀 규정)" };
   }
   return { ok: true };
