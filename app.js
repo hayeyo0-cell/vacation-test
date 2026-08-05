@@ -1257,15 +1257,26 @@ const GUARANTEE_BY_BRANCH = {
 
 // 소속별 "야간" 근무 교번 - 다음날 자동으로 "비번"이 되는 근무.
 // 다음날 정원이 이미 다 찼어도, 전날 야간을 신청한 사람 몫으로 비번 자리가 자동으로 하나 열려야 해요.
-// 경산: 21~29d, 대4 / 문양: 24~34d, 대6
-const NIGHT_SHIFT_CODE_REGEX_BY_BRANCH = {
-  경산: /^(2[1-9]d|대4)$/,
-  문양: /^(2[4-9]d|3[0-4]d|대6)$/,
-};
+// 하드코딩 없이 교번틀(GYOBUN_ORDER) 데이터에서 자동으로 찾아요: 어떤 코드 X의 짝(X+"~", 또는
+// X가 "d"로 끝나면 그 앞부분+"~")이 같은 교번틀 안에 있으면 X를 "야간"으로 판단해요.
+// 예: 25d의 짝 25~가 교번틀에 있으면 25d는 야간 / 대4의 짝 대4~가 있으면 대4도 야간.
+function getNightShiftCodeSet(branch) {
+  const teamKey = REVERSE_TEAM_MAP[branch];
+  const order = GYOBUN_ORDER[teamKey] || [];
+  const codeSet = new Set(order.map((c) => String(c).trim()));
+  const nightSet = new Set();
+  order.forEach((raw) => {
+    const code = String(raw).trim();
+    if (!code || code.endsWith("~")) return;
+    const base = code.endsWith("d") ? code.slice(0, -1) : code;
+    if (codeSet.has(`${base}~`)) nightSet.add(code);
+  });
+  return nightSet;
+}
 function isNightShiftCode(dia, branch) {
-  const regex = NIGHT_SHIFT_CODE_REGEX_BY_BRANCH[branch];
-  if (!regex) return false;
-  return regex.test(String(dia || "").trim());
+  const trimmed = String(dia || "").trim();
+  if (!trimmed) return false;
+  return getNightShiftCodeSet(branch).has(trimmed);
 }
 
 // 야간 근무 신청 시 자동으로 같이 등록/취소되는 "비번" 짝 - 휴가종류 매핑
@@ -1695,7 +1706,6 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   const [managerFormDia, setManagerFormDia] = useState("");
   const [managerFormNote, setManagerFormNote] = useState("");
   const [managerSaving, setManagerSaving] = useState(false);
-
   useEffect(() => {
     let cancelled = false;
     fetchHolidays(viewYear).then((set) => {
