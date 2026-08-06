@@ -1725,7 +1725,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         d.setDate(d.getDate() + 5);
         const limit = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
         const upcoming = (records || [])
-          .filter((v) => v.date >= today && v.date <= limit && v.status !== "취소됨" && !v.confirmedBy)
+          .filter((v) => v.date >= today && v.date <= limit && v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
           .sort((a, b) => a.date.localeCompare(b.date));
         setUpcomingUnconfirmed(upcoming);
       })
@@ -1763,7 +1763,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       .then(() => window.VacationAPI.getByRange(today, limit))
       .then((records) => {
         const upcoming = (records || [])
-          .filter((v) => v.branch === currentUser.branch && v.status !== "취소됨" && !v.confirmedBy)
+          .filter((v) => v.branch === currentUser.branch && v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
           .sort((a, b) => a.date.localeCompare(b.date));
         setBranchUpcomingUnconfirmed(upcoming);
       })
