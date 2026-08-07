@@ -2911,13 +2911,13 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                         ›
                       </button>
                     </div>
-                    <div style={modal.countText}>
+                    <div style={{ ...modal.countText, marginBottom: "4px" }}>
                       휴가자 {activeCount}명
                       {gyeongsanInfo &&
                         ` · 보장대상 ${gyeongsanInfo.capacityCount}/${gyeongsanInfo.capacity}명 (여유 ${gyeongsanInfo.remain}명)`}
                     </div>
                     {!isMidManager && (
-                      <div style={{ fontSize: "13px", color: "#1b3a5c", fontWeight: 700, marginTop: "2px", marginBottom: "8px" }}>
+                      <div style={{ fontSize: "13px", color: "#1b3a5c", fontWeight: 700, marginTop: "2px", marginBottom: "6px" }}>
                         내 교번: {codeForDate(selectedDate) || "-"}
                       </div>
                     )}
