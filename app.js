@@ -2816,7 +2816,9 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
             ) : showRegisterForm ? (
               <React.Fragment>
                 <div style={{ ...modal.dateTitle, color: dateHeaderColor(selectedDate, holidaySet) }}>{formatDateHeader(selectedDate)} 휴가 신청</div>
-                <div style={{ ...modal.countText, marginBottom: "20px" }}>{currentUser.name}님 이름으로 등록돼요</div>
+                <div style={{ ...modal.countText, marginBottom: "20px" }}>
+                  {currentUser.name}님 이름으로 등록돼요 · 내 교번: <strong>{codeForDate(selectedDate) || "-"}</strong>
+                </div>
 
                 <div style={modal.formRow}>
                   <label style={modal.label}>휴가명</label>
@@ -2914,6 +2916,11 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                       {gyeongsanInfo &&
                         ` · 보장대상 ${gyeongsanInfo.capacityCount}/${gyeongsanInfo.capacity}명 (여유 ${gyeongsanInfo.remain}명)`}
                     </div>
+                    {!isMidManager && (
+                      <div style={{ fontSize: "13px", color: "#1b3a5c", fontWeight: 700, marginTop: "2px", marginBottom: "8px" }}>
+                        내 교번: {codeForDate(selectedDate) || "-"}
+                      </div>
+                    )}
                   </React.Fragment>
                 )}
 
