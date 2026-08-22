@@ -398,6 +398,35 @@
       }
       return recordCount;
     },
+
+    // 소속 전체 - 날짜 제한 없이 (백업 등에서 씀, 자주 안 쓰는 무거운 조회예요)
+    async getAll(branch) {
+      const q = query(collection(db, DAYS_COLLECTION), where("branch", "==", branch));
+      const snap = await getDocs(q);
+      const records = [];
+      snap.docs.forEach((d) => {
+        const entries = (d.data() || {}).entries || {};
+        Object.entries(entries).forEach(([entryId, e]) => records.push({ id: entryId, ...e }));
+      });
+      return records;
+    },
+
+    // 기준일 이전 날짜 문서를 통째로 삭제 (연 1회 보관기한 정리용) - 예전 구조와 다르게
+    // 기록 단위가 아니라 "그 날짜 문서 자체"를 지워요 (그 문서 안 기록이 전부 오래된 것들이니까)
+    async deleteOlderThan(cutoffDate) {
+      const q = query(collection(db, DAYS_COLLECTION), where("date", "<", cutoffDate));
+      const snap = await getDocs(q);
+      await Promise.all(snap.docs.map((d) => deleteDoc(doc(db, DAYS_COLLECTION, d.id))));
+      return snap.docs.length;
+    },
+
+    // 소속 전체 날짜 문서를 통째로 삭제 (관리자 "전체 초기화" 버튼용)
+    async removeAllForBranch(branch) {
+      const q = query(collection(db, DAYS_COLLECTION), where("branch", "==", branch));
+      const snap = await getDocs(q);
+      await Promise.all(snap.docs.map((d) => deleteDoc(doc(db, DAYS_COLLECTION, d.id))));
+      return snap.docs.length;
+    },
   };
 
   window.ApprovalAPI = {
