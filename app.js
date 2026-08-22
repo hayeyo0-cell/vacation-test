@@ -1802,11 +1802,15 @@ function confirmNightPairIfAny(record, managerName, onPairConfirmed) {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
       );
-      if (!pairRecord || pairRecord.confirmedBy) return null;
+      if (!pairRecord) return null;
       const valid = expectCompanion
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
         : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType];
       if (!valid) return null;
+      // 짝이 이미 같은 사람으로 확인돼 있으면 손댈 필요 없어요. 그게 아니면(아직 미확인이든,
+      // 다른 사람 이름으로 확인돼 있어서 지금 바꾸는 중이든) 항상 이번 확인자로 맞춰줘요 -
+      // "최초 확인"과 "확인자 변경" 둘 다 이 한 조건으로 같이 처리돼요.
+      if (pairRecord.confirmedBy === managerName) return null;
       return VacFacade.confirm(pairRecord.branch, pairRecord.date, pairRecord.id, managerName).then(() => {
         const confirmedPair = { ...pairRecord, confirmedBy: managerName };
         if (onPairConfirmed) onPairConfirmed(confirmedPair);
@@ -1886,10 +1890,10 @@ function findNightPair(record) {
   }
   if (!pairDate) return Promise.resolve(null);
   return VacFacade.getByDate(pairDate, record.branch)
-    .then((records) => {
+  .then((records) => {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
-        );
+      );
       if (!pairRecord) return null;
       const valid = expectCompanion
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
@@ -3778,9 +3782,9 @@ assignPriority()
                         setManagerFormDia(empId ? codeForEmployeeOnDate(empId, selectedDate) : "");
                       }}
                     >
-                      <option value="">이름 선택</option>
+                        <option value="">이름 선택</option>
                       {[...branchAllEmployees]
-                       .sort((a, b) => a.name.localeCompare(b.name, "ko"))
+                        .sort((a, b) => a.name.localeCompare(b.name, "ko"))
                         .map((emp) => (
                           <option key={emp.id} value={emp.id}>{emp.name}</option>
                         ))}
