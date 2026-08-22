@@ -2618,7 +2618,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         const { record, input } = editingPriorityRef.current;
         const num = parseInt(input, 10);
         if (!Number.isNaN(num) && num >= 1 && num !== record.priority) {
-          window.VacationAPI.update(record.id, { priority: num }).catch((err) =>
+          VacFacade.update(record.branch, record.date, record.id, { priority: num }).catch((err) =>
             console.error("순번 자동저장 실패:", err)
           );
         }
@@ -2810,7 +2810,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       alert("1 이상의 숫자를 입력해주세요");
       return;
     }
-    window.VacationAPI.update(record.id, { priority: num })
+    VacFacade.update(record.branch, record.date, record.id, { priority: num })
       .then(() => {
         setMonthMap((prev) => {
           const next = { ...prev };
@@ -2832,7 +2832,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
   const handleSaveNoteEdit = (record) => {
     const trimmed = noteInput.trim();
-    window.VacationAPI.update(record.id, { note: trimmed })
+    VacFacade.update(record.branch, record.date, record.id, { note: trimmed })
       .then(() => {
         setMonthMap((prev) => {
           const next = { ...prev };
@@ -2855,7 +2855,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
   const handleAdminDelete = (record) => {
     if (!confirm(`[관리자] ${record.name}님의 ${record.vacationType} 기록을 완전히 삭제할까요?\n되돌릴 수 없어요.`)) return;
-    window.VacationAPI.remove(record.id).then(() => {
+    VacFacade.remove(record.branch, record.date, record.id).then(() => {
       setMonthMap((prev) => {
         const next = { ...prev };
         next[selectedDate] = (next[selectedDate] || []).filter((v) => v.id !== record.id);
@@ -3039,7 +3039,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
   // 중간관리자 확인 도장
   const handleConfirmStamp = (record, managerName) => {
-    window.VacationAPI.confirm(record.id, managerName).then(() => {
+    VacFacade.confirm(record.branch, record.date, record.id, managerName).then(() => {
       setMonthMap((prev) => {
         const next = { ...prev };
         next[selectedDate] = (next[selectedDate] || []).map((v) =>
