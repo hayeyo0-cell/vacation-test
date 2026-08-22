@@ -293,6 +293,29 @@
       return records.filter((r) => r.employeeId === employeeId);
     },
 
+    // 짝수달 1일 오픈 직후 딱 1시간만 쓰는 실시간 구독 - 날짜별 문서라 스냅샷이 와도
+    // 최대 31개 문서만 다시 읽으면 돼서, 예전(직원+날짜별) 구조보다 훨씬 저렴해요.
+    subscribeRange(startStr, endStr, branch, callback) {
+      const q = query(
+        collection(db, DAYS_COLLECTION),
+        where("branch", "==", branch),
+        where("date", ">=", startStr),
+        where("date", "<=", endStr)
+      );
+      return onSnapshot(
+        q,
+        (snap) => {
+          const records = [];
+          snap.docs.forEach((d) => {
+            const entries = (d.data() || {}).entries || {};
+            Object.entries(entries).forEach(([entryId, e]) => records.push({ id: entryId, ...e }));
+          });
+          callback(records);
+        },
+        (err) => console.error("실시간 구독 오류(vacation_days):", err)
+      );
+    },
+
     // 새 기록 추가 (본인 신청용) - employeeId당 하루 1건 제한을 트랜잭션으로 안전하게 보장해요.
     async addOnce(branch, dateStr, employeeId, record) {
       const ref = doc(db, DAYS_COLLECTION, dayDocId_(branch, dateStr));
