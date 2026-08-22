@@ -14,10 +14,19 @@ const GAS_URL =
 
 // 경산 휴가 데이터 - 교번앱이 이미 안정적으로 쓰고 있는 검증된 API (날짜가 완성된 형태로 옴)
 const VACATION_API_URL =
-  "https://script.google.com/macros/s/AKfycby_p9K5jW7LTxAGy_uTTV88KcEGtnFQAEy7UctYq4Xkv2lpTj5RtR-mOACfic_BmE29kQ/exec";
+  "https://script.google.com/macros/s/AKfycbxx07MyxgIYUHweQQYF_7ioGqekeVql3wdlTDt2fmYGEXKS0L4CRFzV50vZRdLVg0C5/exec";
 
 // 가져오기 테스트에서 이 날짜 이전 기록은 제외 (필요하면 이 값만 바꾸면 돼요)
 const IMPORT_FROM_DATE = "2026-07-01";
+
+// 자동 백업 주기 - 마지막 백업 이후 이 시간이 지나면 관리자/운용이 앱을 열 때 자동으로 백업돼요.
+const BACKUP_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 1주일
+// 서버 스케줄러가 없어서 "정확히 몇 시"는 보장 못 하지만, 이 시간대(한국시간)에 누군가 앱을
+// 열면 그때 우선 백업을 실행해요 (사람이 안 쓰는 새벽 시간대를 노려서 조용히 실행하려는 목적).
+const BACKUP_PREFERRED_HOUR_START = 1; // 새벽 1시부터
+const BACKUP_PREFERRED_HOUR_END = 4; // 새벽 4시까지 (이 시각 전까지)
+// 그 시간대에 아무도 접속을 안 해서 계속 못 돌면, 이만큼 밀렸을 때는 시간 상관없이 강제로 실행해요
+const BACKUP_FORCE_OVERDUE_MS = 9 * 24 * 60 * 60 * 1000; // 9일 (1주일 + 여유 2일)
 
 // 밴드 채팅방 바로가기 (경산승무팀)
 const BAND_URL = "https://band.us/band/51746678/chat/C4U1ay";
@@ -25,7 +34,7 @@ const BAND_URL = "https://band.us/band/51746678/chat/C4U1ay";
 const TEAM_MAP = { ks: "경산", my: "문양" }; // 안심(as)/월배(wb)는 이 앱 대상 아님
 // ⚠️ 테스트 모드: true면 누구나 교번확인/승인 없이 바로 들어갈 수 있어요.
 // 실제 운영 시작하면 반드시 false로 바꿔주세요!
-const TEST_MODE = true;
+const TEST_MODE = false;
 
 const REVERSE_TEAM_MAP = { 경산: "ks", 문양: "my" };
 
@@ -35,25 +44,38 @@ function isMidManagerUser(user, managers) {
   return (managers || []).some((m) => m.name === user.name && m.branch === user.branch);
 }
 
-function jsonpRequest(url, params) {
+function jsonpRequest(url, params, timeoutMs = 6000) {
   return new Promise((resolve, reject) => {
     const callbackName = "jsonp_cb_" + Math.random().toString(36).slice(2);
     const query = new URLSearchParams({ ...params, callback: callbackName }).toString();
     const script = document.createElement("script");
     script.src = url + "?" + query;
 
+    let settled = false;
     const cleanup = () => {
       delete window[callbackName];
       script.remove();
+      clearTimeout(timer);
     };
 
-    window[callbackName] = (data) => {
-      resolve(data);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       cleanup();
+      reject(new Error("응답이 늦어져서(타임아웃) 요청을 다시 시도해요"));
+    }, timeoutMs);
+
+    window[callbackName] = (data) => {
+      if (settled) return; // 타임아웃으로 이미 포기한 뒤에 뒤늦게 응답이 와도 무시
+      settled = true;
+      cleanup();
+      resolve(data);
     };
     script.onerror = () => {
-      reject(new Error("네트워크 오류로 직원 데이터를 불러오지 못했어요"));
+      if (settled) return;
+      settled = true;
       cleanup();
+      reject(new Error("네트워크 오류로 직원 데이터를 불러오지 못했어요"));
     };
 
     document.body.appendChild(script);
@@ -69,6 +91,14 @@ function koreaTodayStr() {
   const m = String(kst.getMonth() + 1).padStart(2, "0");
   const d = String(kst.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+// 한국 시간 기준 현재 시(0~23) - 자동 백업을 새벽 시간대에 우선 실행하기 위한 용도
+function koreaCurrentHour() {
+  const now = new Date();
+  const utcTime = now.getTime() + now.getTimezoneOffset() * 60000;
+  const kst = new Date(utcTime + 9 * 60 * 60000);
+  return kst.getHours();
 }
 
 // 오늘이 "짝수달 1일"인지 확인 (경산 - 다음 두 달 휴가를 선착순으로 신청받는 날, 순번 조정 가능일)
@@ -111,6 +141,43 @@ function shiftCodeByDays_(order, baseCode, dayOffset) {
 let GYOBUN_ORDER = { ks: [], my: [] }; // 달력 교번 계산용
 let BASE_DATE = ""; // 달력 교번 계산용 (기준일)
 
+const LS_EMPLOYEES_CACHE = "gyeongsan_employees_cache";
+
+// 직전에 성공적으로 받아온 직원/교번 데이터를 저장해둬요 - 다음에 앱을 켰을 때
+// 네트워크 응답을 기다리지 않고 일단 이걸로 즉시 화면을 채우고, 최신 데이터는 뒤에서 조용히 갱신해요.
+function saveEmployeesCache(list) {
+  try {
+    localStorage.setItem(
+      LS_EMPLOYEES_CACHE,
+      JSON.stringify({ employees: list, gyobunOrder: GYOBUN_ORDER, baseDate: BASE_DATE, savedAt: Date.now() })
+    );
+  } catch (_) {}
+}
+
+function loadEmployeesCache() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LS_EMPLOYEES_CACHE) || "null");
+    if (!raw || !Array.isArray(raw.employees) || !raw.employees.length) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+// 캐시에 저장된 기준일 기준 코드를, "오늘" 기준으로 다시 밀어서 계산해요.
+// (캐시가 며칠 전에 저장된 거라도, baseCode+교번틀만 있으면 오늘자 코드를 정확히 다시 계산할 수 있어요)
+function recomputeTodayCodesFromCache(cache) {
+  const gyobunOrder = cache.gyobunOrder || { ks: [], my: [] };
+  const baseDate = cache.baseDate || "";
+  const today = koreaTodayStr();
+  const dayOffset = baseDate ? diffDays_(baseDate, today) : 0;
+  return (cache.employees || []).map((e) => {
+    const teamKey = REVERSE_TEAM_MAP[e.branch];
+    const order = gyobunOrder[teamKey] || [];
+    return { ...e, code: shiftCodeByDays_(order, e.baseCode, dayOffset) };
+  });
+}
+
 function fetchEmployees() {
   return Promise.all([
     jsonpRequest(GAS_URL, { mode: "roster" }),
@@ -129,7 +196,7 @@ function fetchEmployees() {
     const today = koreaTodayStr();
     const dayOffset = BASE_DATE ? diffDays_(BASE_DATE, today) : 0;
 
-    return rosterRes.rows
+    const list = rosterRes.rows
       .filter((r) => r.team === "ks" || r.team === "my")
       .map((r) => {
         const order = orderRes[r.team] || [];
@@ -142,6 +209,19 @@ function fetchEmployees() {
           baseCode: r.gyobun, // 기준일(4/1) 원본 (참고용)
         };
       });
+    saveEmployeesCache(list);
+    return list;
+  });
+}
+
+// 네트워크 순간 오류 등으로 직원 데이터 로드가 실패하면, 조용히 포기하지 않고 몇 번 더 재시도해요.
+function fetchEmployeesWithRetry(retries = 3, delayMs = 700) {
+  return fetchEmployees().catch((err) => {
+    if (retries <= 0) throw err;
+    console.warn(`직원 데이터 로드 실패, ${delayMs}ms 후 재시도 (남은 재시도: ${retries})`, err);
+    return new Promise((resolve) => setTimeout(resolve, delayMs)).then(() =>
+      fetchEmployeesWithRetry(retries - 1, delayMs)
+    );
   });
 }
 
@@ -161,6 +241,58 @@ function loadLocalAuth() {
   } catch {
     return [];
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 자주 안 바뀌는 목록(운용 명단 등) 캐싱 헬퍼 - 무료 읽기 한도 절약용         */
+/* 경산/문양(테스트)은 APP_STORAGE_SUFFIX로 캐시 저장소가 자동 분리돼요.       */
+/* ------------------------------------------------------------------ */
+function loadCachedList(cacheKey, ttlMs, fetcher, forceRefresh) {
+  const fullKey = cacheKey + (window.APP_STORAGE_SUFFIX || "");
+  if (!forceRefresh) {
+    try {
+      const raw = localStorage.getItem(fullKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Date.now() - parsed.savedAt < ttlMs) {
+          return Promise.resolve(parsed.data);
+        }
+      }
+    } catch {
+      // 캐시가 깨져 있으면 그냥 새로 불러와요
+    }
+  }
+  return fetcher().then((data) => {
+    try {
+      localStorage.setItem(fullKey, JSON.stringify({ savedAt: Date.now(), data }));
+    } catch {
+      // 저장 공간이 꽉 찼거나 하면 캐싱만 실패 - 기능엔 지장 없음
+    }
+    return data;
+  });
+}
+
+function invalidateCachedList(cacheKey) {
+  const fullKey = cacheKey + (window.APP_STORAGE_SUFFIX || "");
+  localStorage.removeItem(fullKey);
+}
+
+const MANAGER_CACHE_KEY = "vacation_managers_cache";
+// 운용 명단은 로그인 권한 판단에도 쓰여서(새로 등록된 운용자가 바로 로그인해야 할 수 있음)
+// 너무 길게 캐싱하면 안 돼요. 5분 정도면 짧은 시간 안에 여러 명이 몰려 접속할 때의
+// 중복 읽기는 웬만큼 줄이면서, 신규 등록자가 오래 기다리는 일은 거의 없게 해줘요.
+const MANAGER_CACHE_TTL_MS = 5 * 60 * 1000; // 5분
+
+// 🆕 PIN을 그대로 서버에 저장하지 않고, "직원ID+PIN"을 변형(해시)한 값만 저장해요.
+// 이러면 Firestore를 누가 열어봐도 진짜 PIN 자체는 알 수 없고, 같은 PIN이어도 사람마다
+// 다른 값으로 저장돼요 (직원ID가 "소금" 역할). 로그인할 때도 이 변형값끼리만 비교해요.
+async function hashPin(id, pin) {
+  const enc = new TextEncoder();
+  const data = enc.encode(`${id}:${pin}`);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /* ------------------------------------------------------------------ */
@@ -400,6 +532,43 @@ function InstallBanner({ installPrompt, onInstall, showIosHint, dismissed, onDis
 }
 
 /* ------------------------------------------------------------------ */
+/* 에러 경계 - 특정 화면(주로 실험적인 관리자 도구)에서 예상 못한 오류가 나도  */
+/* 앱 전체가 하얗게 죽지 않고, 그 화면만 에러 안내로 대체되도록 막아줘요.     */
+/* ------------------------------------------------------------------ */
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error("ErrorBoundary가 잡은 오류:", error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={modal.overlay} onClick={this.props.onClose}>
+          <div style={{ ...modal.sheet, maxWidth: "340px" }} onClick={(e) => e.stopPropagation()}>
+            <div style={modal.dateTitle}>⚠️ 오류가 발생했어요</div>
+            <div style={{ fontSize: "13px", color: "#e02020", whiteSpace: "pre-wrap", marginBottom: "14px" }}>
+              {String(
+                this.state.error && this.state.error.message
+                  ? this.state.error.message
+                  : this.state.error
+              )}
+            </div>
+            <button style={modal.closeBtn} onClick={this.props.onClose}>{this.props.closeLabel || "닫기"}</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 메인 앱                                                              */
 /* ------------------------------------------------------------------ */
 function App() {
@@ -470,9 +639,18 @@ function App() {
       setStep("loginName");
     }
 
+    // 캐시가 있으면 네트워크 응답을 기다리지 않고 일단 이걸로 즉시 채워요 (오늘 날짜 기준으로 다시 계산).
+    // 최신 데이터는 바로 아래에서 어차피 새로 받아와서 덮어써요 - 이건 그 사이의 "대기시간"만 없애는 용도예요.
+    const cache = loadEmployeesCache();
+    if (cache) {
+      GYOBUN_ORDER = cache.gyobunOrder || { ks: [], my: [] };
+      BASE_DATE = cache.baseDate || "";
+      setEmployees(recomputeTodayCodesFromCache(cache));
+    }
+
     // 직원 데이터는 신규 등록 시 필요하고, 재로그인 사용자도 달력의 날짜별 교번 표시에 필요해서
-    // 어차피 백그라운드로 가져옴
-    fetchEmployees()
+    // 어차피 백그라운드로 가져옴. 실패하면 조용히 포기하지 않고 자동으로 재시도해요.
+    fetchEmployeesWithRetry()
       .then((list) => {
         setEmployees(list);
         if (auth.length === 0) setStep("chooseBranch");
@@ -483,12 +661,25 @@ function App() {
           alert("직원 데이터를 불러오지 못했어요: " + (err && err.message ? err.message : err));
           setStep("chooseBranch");
         }
-        // 재로그인 사용자는 이미 화면이 떠 있으니 조용히 재시도만 실패 처리 (콘솔 로그만)
+        // 재로그인 사용자는 이미 화면이 떠 있어요. 빠른 재시도(fetchEmployeesWithRetry)까지 다
+        // 실패했어도 완전히 포기하지 않고, 좀 더 여유 있는 간격으로 배경에서 계속 시도해요
+        // (네트워크가 잠깐 불안정해도 결국엔 알아서 채워지도록 - "···"에 영영 갇히는 것 방지).
+        const keepTryingInBackground = (attemptsLeft) => {
+          if (attemptsLeft <= 0) return;
+          setTimeout(() => {
+            fetchEmployees()
+              .then((list) => setEmployees(list))
+              .catch(() => keepTryingInBackground(attemptsLeft - 1));
+          }, 8000);
+        };
+        keepTryingInBackground(15); // 8초 간격으로 최대 15번 더 (약 2분)
       });
 
-    // 운용(중간관리자) 명단은 Firestore에서 불러옴
+    // 운용(중간관리자) 명단은 Firestore에서 불러옴 (1시간 캐싱 - 자주 안 바뀌니 매번 새로 읽지 않아요)
     waitForFirestore()
-      .then(() => window.ManagerAPI.list())
+      .then(() =>
+        loadCachedList(MANAGER_CACHE_KEY, MANAGER_CACHE_TTL_MS, () => window.ManagerAPI.list())
+      )
       .then((list) => setManagers(list))
       .catch((err) => console.error("운용 명단 로드 실패:", err));
 
@@ -499,9 +690,14 @@ function App() {
     const lastCleanupYear = parseInt(localStorage.getItem(CLEANUP_KEY) || "0", 10);
     if (lastCleanupYear < currentYear) {
       waitForFirestore()
-        .then(() => window.VacationAPI.deleteOlderThan(`${currentYear - 1}-01-01`))
+        .then(() =>
+          Promise.all([
+            window.VacationAPI.deleteOlderThan(`${currentYear - 1}-01-01`),
+            window.HyuchungdangAPI.deleteOlderThan(`${currentYear - 1}-01-01`),
+          ])
+        )
         .then(() => localStorage.setItem(CLEANUP_KEY, String(currentYear)))
-        .catch((err) => console.error("오래된 휴가 기록 정리 실패:", err));
+        .catch((err) => console.error("오래된 기록 정리 실패:", err));
     }
   }, []);
 
@@ -588,7 +784,10 @@ function App() {
       .then(() => window.ApprovalAPI.getStatus(emp.id))
       .then((data) => {
         if (data && data.status === "approved") {
-          alert("이미 다른 기기에서 승인받아 사용 중인 계정이에요.\n\n휴대폰을 바꾸신 거라면, 관리자(권재림)에게 '기기변경'을 요청해주세요. 관리자가 처리해주면 다시 등록하실 수 있어요.");
+          // 🆕 무조건 막지 않고, 이 계정 PIN을 알고 있으면 이 자리에서 바로 로그인할 수 있게 해요.
+          setSelectedEmp(emp);
+          setPinError("");
+          setStep("crossBrowserPin");
           return;
         }
         if (data && data.status === "pending") {
@@ -626,6 +825,12 @@ function App() {
     saveLocalAuth(updated);
     setLocalAuth(updated);
 
+    // 🆕 PIN 해시를 서버에도 저장해둬요 - 나중에 다른 브라우저에서 로그인할 때 대조용으로 써요.
+    // 실패해도(오프라인 등) 등록 자체는 계속 진행시켜요 (로컬 저장은 이미 됐으니까).
+    hashPin(selectedEmp.id, pin)
+      .then((pinHash) => waitForFirestore().then(() => window.AuthAPI.setPinHash(selectedEmp.id, pinHash)))
+      .catch((err) => console.error("PIN 해시 저장 실패:", err));
+
     if (TEST_MODE || isAdminUser(selectedEmp) || isMidManagerUser(selectedEmp, managers)) {
       // 관리자는 승인 절차 없이 바로 진입 (본인이 승인권자니까)
       setStep("main");
@@ -655,6 +860,13 @@ function App() {
       return;
     }
 
+    // 🆕 예전(이 기능 생기기 전)에 등록한 사람은 서버에 PIN 해시가 없을 수 있어요.
+    // 정상적으로 로그인에 성공한 이 순간, 조용히 백그라운드로 해시를 채워둬서
+    // 이 사람도 다음부터는 다른 브라우저에서 로그인할 수 있게 해요.
+    hashPin(loginTarget.id, pin)
+      .then((pinHash) => waitForFirestore().then(() => window.AuthAPI.setPinHash(loginTarget.id, pinHash)))
+      .catch((err) => console.error("PIN 해시 백필 실패:", err));
+
     if (TEST_MODE || isAdminUser(loginTarget) || isMidManagerUser(loginTarget, managers)) {
       setStep("main");
       return;
@@ -663,10 +875,32 @@ function App() {
     waitForFirestore()
       .then(() => window.ApprovalAPI.getStatus(loginTarget.id))
       .then((data) => {
-        if (!data || data.status === "pending") {
+        // 명단(직원목록)에 아직 이 사람 이름이 있는지 확인 - ID가 아니라 이름 기준이에요.
+        // (자리 바꿀 때 ID는 고정, 이름을 서로 바꾸는 방식으로 운영하고 계셔서, 그 사람이
+        // "진짜로 없어졌는지"는 이름으로 찾아야 정확해요)
+        const stillInRoster = (employees || []).some(
+          (e) => e.name === loginTarget.name && e.branch === loginTarget.branch
+        );
+        if (!data) {
+          // 승인 기록이 없어졌어요 - 관리자가 "기록삭제"를 눌렀거나, 예전 TEST_MODE 가입자예요.
+          if (!stillInRoster) {
+            setStep("notInRoster");
+            return null;
+          }
+          return window.ApprovalAPI.request({
+            id: loginTarget.id,
+            name: loginTarget.name,
+            branch: loginTarget.branch,
+          }).then(() => setStep("pendingApproval"));
+        }
+        if (data.status === "pending") {
           setStep("pendingApproval");
         } else if (data.status === "rejected") {
           setStep("rejected");
+        } else if (!stillInRoster) {
+          // 🆕 승인 기록은 그대로 있지만(관리자가 "기록삭제"를 안 눌렀어도), 정상 로그인할
+          // 때마다 명단에 아직 있는지 슬쩍 확인해요 - 인사이동으로 명단에서만 빠진 경우를 잡아내요.
+          setStep("notInRoster");
         } else {
           setStep("main");
         }
@@ -677,10 +911,69 @@ function App() {
       });
   };
 
+  // 🆕 다른 브라우저(새 기기 취급되는 상황)에서 이미 승인된 계정으로 로그인 - 서버에 저장된
+  // PIN 해시랑 대조해서 확인해요. 성공하면 이 브라우저에도 로컬로 저장해서 다음부턴 빠르게 써요.
+  const handleCrossBrowserPin = (pin) => {
+    hashPin(selectedEmp.id, pin)
+      .then((pinHash) =>
+        waitForFirestore()
+          .then(() => Promise.all([window.AuthAPI.getPinHash(selectedEmp.id), window.ApprovalAPI.getStatus(selectedEmp.id)]))
+          .then(([storedHash, approvalData]) => {
+            if (!approvalData || approvalData.status !== "approved") {
+              setPinError("이 계정은 지금 승인된 상태가 아니에요. 관리자에게 문의해주세요.");
+              return;
+            }
+            if (!storedHash) {
+              setPinError("이 계정은 아직 이 방법으로 로그인할 수 없어요. 원래 쓰던 기기에서 한 번 로그인해주시면 다음부터 가능해져요.");
+              return;
+            }
+            if (storedHash !== pinHash) {
+              setPinError("PIN이 일치하지 않아요");
+              return;
+            }
+            // 🆕 여기서도 명단에 아직 있는지 확인해요 (이름 기준)
+            const stillInRoster = (employees || []).some(
+              (e) => e.name === selectedEmp.name && e.branch === selectedEmp.branch
+            );
+            if (!stillInRoster) {
+              setStep("notInRoster");
+              return;
+            }
+            const updated = [...localAuth, { id: selectedEmp.id, name: selectedEmp.name, branch: selectedEmp.branch, pin }];
+            saveLocalAuth(updated);
+            setLocalAuth(updated);
+            setPinError("");
+            setStep("main");
+          })
+      )
+      .catch((err) => {
+        console.error(err);
+        setPinError("확인 중 오류가 발생했어요");
+      });
+  };
+
   const handleResetAll = () => {
     if (!confirm("이 기기에 저장된 로그인 정보를 전부 지울까요?\n(테스트용 초기화 - 다시 처음부터 등록해야 해요)")) return;
     localStorage.removeItem(STORAGE_KEY);
     setLocalAuth([]);
+    setStep("chooseBranch");
+  };
+
+  // PIN을 잊었을 때 - 이 기기에 저장된 "본인 것만" 지우고 처음부터 다시 등록하게 해요.
+  // (다른 사람이 같은 기기에 같이 등록되어 있어도 그 사람 건 안 건드려요)
+  const handleForgotPin = () => {
+    if (!loginTarget) return;
+    if (
+      !confirm(
+        `${loginTarget.name}님의 이 기기 등록 정보를 지우고 처음부터 다시 등록할까요?\n(다시 등록하면 관리자 승인을 다시 받아야 해요)`
+      )
+    )
+      return;
+    const updated = localAuth.filter((a) => a.id !== loginTarget.id);
+    saveLocalAuth(updated);
+    setLocalAuth(updated);
+    setLoginTarget(null);
+    setPinError("");
     setStep("chooseBranch");
   };
 
@@ -874,12 +1167,22 @@ function App() {
         <button
           style={styles.primaryButton}
           onClick={() => {
-            const id = (loginTarget || selectedEmp)?.id;
+            const target = loginTarget || selectedEmp;
+            const id = target?.id;
             if (!id) return;
             window.ApprovalAPI.getStatus(id).then((data) => {
-              if (data && data.status === "approved") setStep("main");
-              else if (data && data.status === "rejected") setStep("rejected");
-              else alert("아직 승인 대기중이에요");
+              if (data && data.status === "approved") {
+                setStep("main");
+              } else if (data && data.status === "rejected") {
+                setStep("rejected");
+              } else if (!data) {
+                // 승인 기록이 아예 없으면(TEST_MODE 시절 가입 등) 여기서 자동으로 신청 생성
+                window.ApprovalAPI.request({ id: target.id, name: target.name, branch: target.branch })
+                  .then(() => alert("신청을 새로 등록했어요. 관리자 확인을 기다려주세요."))
+                  .catch((err) => alert("신청 등록 실패: " + (err && err.message ? err.message : err)));
+              } else {
+                alert("아직 승인 대기중이에요");
+              }
             });
           }}
         >
@@ -904,11 +1207,52 @@ function App() {
       </div>
     );
   }
+  // 🆕 승인 기록이 없어졌고, 직원명단(스프레드시트)에서도 이름이 사라진 경우 - 인사이동/퇴사로 추정돼요.
+  if (step === "notInRoster") {
+    return (
+      <div style={styles.screen}>
+        <div style={styles.title}>현재 직원명단에서 확인되지 않아요</div>
+        <div style={styles.subText}>인사이동·퇴사 등의 사유로 명단에서 빠진 것으로 보여요.<br />문의사항은 관리자에게 연락해주세요.</div>
+        <button style={{ ...styles.button, border: "none", color: "#888" }} onClick={() => setStep("loginName")}>
+          나가기
+        </button>
+      </div>
+    );
+  }
   if (step === "loginPin") {
     return (
       <div style={styles.screen}>
         <div style={styles.title}>{loginTarget.name}님, PIN을 입력해주세요</div>
         <PinPad onComplete={handleLoginPin} error={pinError} />
+        <button
+          style={{ ...styles.button, border: "none", color: "#888", marginTop: "20px" }}
+          onClick={handleForgotPin}
+        >
+          PIN을 잊으셨나요? 다시 등록하기
+        </button>
+      </div>
+    );
+  }
+
+  // 🆕 다른 브라우저(새 기기 취급)에서, 이미 승인된 계정이면 PIN만 확인하고 바로 로그인
+  if (step === "crossBrowserPin") {
+    return (
+      <div style={styles.screen}>
+        <div style={styles.title}>{selectedEmp?.name}님, 이미 승인된 계정이에요</div>
+        <div style={styles.subText}>원래 쓰시던 PIN을 입력하면 이 브라우저에서도 바로 로그인돼요</div>
+        <PinPad onComplete={handleCrossBrowserPin} error={pinError} />
+        <button
+          style={{ ...styles.button, border: "none", color: "#888", marginTop: "20px" }}
+          onClick={() => {
+            setPinError("");
+            setStep("chooseBranch");
+          }}
+        >
+          취소하고 처음으로
+        </button>
+        <div style={{ ...styles.subText, marginTop: "16px", fontSize: "13px" }}>
+          PIN이 기억 안 나시면, 관리자에게 '기록삭제'를 요청해주세요.
+        </div>
       </div>
     );
   }
@@ -958,12 +1302,33 @@ function formatDateHeader(dateStr) {
   return `${dateStr} ${WEEKDAYS[d.getDay()]}요일`;
 }
 
-function formatEntryTime(ts) {
-  if (!ts) return "";
-  const date = typeof ts.toDate === "function" ? ts.toDate() : new Date(ts);
-  if (isNaN(date.getTime())) return "";
+// Firestore Timestamp 객체든, 캐시/저장을 거치면서 일반 객체({seconds, nanoseconds})로 바뀐 것이든,
+// 문자열/Date든 상관없이 안전하게 밀리초 값으로 변환해요. 하나라도 형태가 안 맞으면 못 구해서
+// 정렬이 꼬이는 걸 방지하려고, formatEntryTime 표시 로직이랑 정렬 로직이 똑같이 이 함수를 써요.
+function timestampToMillis_(ts) {
+  if (!ts) return null;
+  if (typeof ts.toMillis === "function") return ts.toMillis();
+  if (typeof ts.toDate === "function") {
+    const d = ts.toDate();
+    return isNaN(d.getTime()) ? null : d.getTime();
+  }
+  if (typeof ts === "object" && typeof ts.seconds === "number") {
+    return ts.seconds * 1000 + (typeof ts.nanoseconds === "number" ? ts.nanoseconds / 1e6 : 0);
+  }
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
+// dateOnly가 true면(가져오기로 들어와 실제 신청 "시각" 정보가 없는 기록) 시간 없이 날짜만 표시해요.
+function formatEntryTime(ts, dateOnly) {
+  const millis = timestampToMillis_(ts);
+  if (millis == null) return "";
+  const date = new Date(millis);
   const mo = String(date.getMonth() + 1).padStart(2, "0");
   const dd = String(date.getDate()).padStart(2, "0");
+  if (dateOnly) {
+    return `${date.getMonth() + 1}/${date.getDate()} 입력`;
+  }
   const hh = String(date.getHours()).padStart(2, "0");
   const mm = String(date.getMinutes()).padStart(2, "0");
   return `${mo}/${dd} ${hh}:${mm} 입력`;
@@ -1157,6 +1522,42 @@ function isCapacityType(type) {
   return CAPACITY_TYPES.includes(type);
 }
 
+// 삭제/취소 등으로 생긴 순번 구멍을 없애기 위해, 특정 날짜의 남은 보장휴가 순번을 1번부터 다시 매김
+// (여러 화면에서 같이 쓰는 공용 함수라 모듈 레벨에 둠 - MainScreen, MyVacationsPanel 등)
+function renumberDayPriorities_(dateStr, branch, onDone) {
+  window.VacationAPI.getByDate(dateStr, branch)
+    .then((records) => {
+      // 취소된 기록도 그 번호를 계속 차지해요 (취소됐다고 뒷사람이 번호를 당겨쓰지 않아요) -
+      // 그래서 취소 여부와 상관없이, 그날 전체 기록을 입력 시각 순서로 쭉 번호 매겨요.
+      const capacityAll = (records || [])
+        .filter((v) => v.branch === branch && isCapacityType(v.vacationType))
+        .sort((a, b) => {
+          // 입력 날짜/시간(createdAt) 순서가 기준이에요. 없는 기록(옛날 가져오기 등)은 맨 뒤로.
+          const ta = timestampToMillis_(a.createdAt);
+          const tb = timestampToMillis_(b.createdAt);
+          if (ta == null && tb == null) return (a.name || "").localeCompare(b.name || "");
+          if (ta == null) return 1;
+          if (tb == null) return -1;
+          if (ta !== tb) return ta - tb;
+          return (a.name || "").localeCompare(b.name || "");
+        });
+      const updates = [];
+      capacityAll.forEach((v, idx) => {
+        const newPriority = idx + 1;
+        if (v.priority !== newPriority) {
+          updates.push(window.VacationAPI.update(v.id, { priority: newPriority }));
+        }
+      });
+      return Promise.all(updates).then(() => window.VacationAPI.getByDate(dateStr, branch));
+    })
+    .then((freshRecords) => {
+      // 그날이 속한 달의 달력 캐시를 지워둬요 - 순번이 바뀐 채로 캐시가 오래 남지 않게
+      if (freshRecords && onDone) onDone(freshRecords);
+    })
+    .catch((err) => console.error("순번 재정렬 실패:", err));
+}
+
+
 // 보장휴가(연차·분지 등)를 순번(priority) 순서로 먼저, 미보장(청휴·병가·노조 등)은 그 아래로 정렬 - 여러 곳에서 재사용
 function sortRecordsForDisplay(records) {
   return [...records].sort((a, b) => {
@@ -1232,6 +1633,35 @@ function getDayType(dateStr, holidaySet) {
   return "평일";
 }
 
+// 토요일/휴일엔 일부 DIA가 운휴(운행이 없음)라서 그 사람은 비게 돼요 - 이걸 S1,S2...로 불러요.
+const S_CODE_MAP = {
+  경산: { 토요일: ["20d"], 휴일: ["17d", "18d", "19d", "20d"] },
+  문양: { 토요일: ["9d", "10d"], 휴일: ["7d", "8d", "9d", "10d"] },
+};
+
+// 안내문구에 "20d(S4)"처럼 참고용으로 같이 보여줄 때 쓰는 함수 - 실제 신청/저장되는 값은
+// 절대 안 건드리고, 순전히 "사람이 읽는 문구"에만 괄호로 덧붙여요.
+function withSLabel(branch, dateStr, rawCode, holidaySet) {
+  const clean = String(rawCode || "").trim();
+  if (!clean) return clean;
+  const dayType = getDayType(dateStr, holidaySet);
+  const sDiaOrder = (S_CODE_MAP[branch] && S_CODE_MAP[branch][dayType]) || [];
+  const idx = sDiaOrder.indexOf(clean);
+  if (idx === -1) return clean;
+  return `${clean}(S${idx + 1})`;
+}
+
+// 달력칸처럼 좁은 곳에서 쓸 때 - "S4"만 따로 반환해서, 코드보다 작은 글씨로 붙여 넣을 수 있게 해요.
+// (withSLabel처럼 한 문자열로 합치면 "20d(S4)"가 칸 너비보다 길어져서 "20d..."로 잘려버려요)
+function getSLabelOnly(branch, dateStr, rawCode, holidaySet) {
+  const clean = String(rawCode || "").trim();
+  if (!clean) return null;
+  const dayType = getDayType(dateStr, holidaySet);
+  const sDiaOrder = (S_CODE_MAP[branch] && S_CODE_MAP[branch][dayType]) || [];
+  const idx = sDiaOrder.indexOf(clean);
+  return idx === -1 ? null : `S${idx + 1}`;
+}
+
 // 날짜 헤더 표시용 색상 - 토요일은 파란색, 휴일(공휴일·일요일)은 빨간색, 평일은 기본색
 function dateHeaderColor(dateStr, holidaySet) {
   const type = getDayType(dateStr, holidaySet);
@@ -1305,13 +1735,15 @@ function shiftDateStr_(dateStr, delta) {
 // - record가 "비번"(연차비 등, DIA 끝이 "~")이면 → 전날 야간 짝을 찾아 취소
 // onPairCancelled(pairRecord)는 짝이 실제로 취소됐을 때 호출되는 콜백 (화면 상태 갱신용).
 function cancelNightPairIfAny(record, onPairCancelled) {
-  const dia = String(record.dia || "").trim();
+  // DIA 표기(25d/25~ 등)에 의존하지 않고, "휴가종류가 연차·분지·장재 ↔ 연차비·분지비·장재비"이고
+  // 같은 직원ID로 바로 다음날/전날에 있으면 짝으로 판단해요. (연차비 등은 애초에 야간 다음날
+  // 비번 용도로만 쓰여서 DIA 표기가 시트마다 달라도 안전하게 짝을 찾을 수 있어요)
   let pairDate = null;
   let expectCompanion = null;
-  if (NIGHT_COMPANION_TYPE_MAP[record.vacationType] && isNightShiftCode(dia, record.branch)) {
+  if (NIGHT_COMPANION_TYPE_MAP[record.vacationType]) {
     pairDate = shiftDateStr_(record.date, 1);
     expectCompanion = true;
-  } else if (NIGHT_COMPANION_TYPES_REVERSE[record.vacationType] && dia.endsWith("~")) {
+  } else if (NIGHT_COMPANION_TYPES_REVERSE[record.vacationType]) {
     pairDate = shiftDateStr_(record.date, -1);
     expectCompanion = false;
   }
@@ -1320,7 +1752,7 @@ function cancelNightPairIfAny(record, onPairCancelled) {
   // 문서 ID를 추측하지 않고, 그 날짜 기록 중 같은 직원ID를 찾아요.
   // (본인이 앱에서 직접 신청한 건 "직원ID_날짜" 고정ID지만, 가져오기/대신기록으로 들어온 건
   //  Firestore가 임의로 만든 ID라서 ID 추측 방식으로는 못 찾기 때문)
-  return window.VacationAPI.getByDate(pairDate)
+  return window.VacationAPI.getByDate(pairDate, record.branch)
     .then((records) => {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
@@ -1328,7 +1760,7 @@ function cancelNightPairIfAny(record, onPairCancelled) {
       if (!pairRecord) return null;
       const valid = expectCompanion
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
-        : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType] && isNightShiftCode(pairRecord.dia, pairRecord.branch);
+        : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType];
       if (!valid) return null;
       return window.VacationAPI.cancel(pairRecord.id).then(() => {
         if (onPairCancelled) onPairCancelled(pairRecord);
@@ -1341,6 +1773,75 @@ function cancelNightPairIfAny(record, onPairCancelled) {
     });
 }
 
+// 야간+비번 짝 기록을 찾아서 반대쪽도 같이 확인(승인) 처리해요 (한쪽을 확인하면 반대쪽도 자동 확인).
+// - record가 "야간"(연차/분지/장재 + 야간교번)이면 → 다음날 비번(연차비 등) 짝을 찾아 확인
+// - record가 "비번"(연차비 등)이면 → 전날 야간 짝을 찾아 확인
+// 이미 확인된 짝이거나 취소된 짝이면 건드리지 않아요.
+// onPairConfirmed(pairRecord)는 짝이 실제로 확인됐을 때 호출되는 콜백 (화면 상태 갱신용).
+function confirmNightPairIfAny(record, managerName, onPairConfirmed) {
+  let pairDate = null;
+  let expectCompanion = null;
+  if (NIGHT_COMPANION_TYPE_MAP[record.vacationType]) {
+    pairDate = shiftDateStr_(record.date, 1);
+    expectCompanion = true;
+  } else if (NIGHT_COMPANION_TYPES_REVERSE[record.vacationType]) {
+    pairDate = shiftDateStr_(record.date, -1);
+    expectCompanion = false;
+  }
+  if (!pairDate) return Promise.resolve(null);
+
+  return window.VacationAPI.getByDate(pairDate, record.branch)
+    .then((records) => {
+      const pairRecord = (records || []).find(
+        (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
+      );
+      if (!pairRecord || pairRecord.confirmedBy) return null;
+      const valid = expectCompanion
+        ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
+        : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType];
+      if (!valid) return null;
+      return window.VacationAPI.confirm(pairRecord.id, managerName).then(() => {
+        const confirmedPair = { ...pairRecord, confirmedBy: managerName };
+        if (onPairConfirmed) onPairConfirmed(confirmedPair);
+        return confirmedPair;
+      });
+    })
+    .catch((err) => {
+      console.error("야간 짝 확인 실패:", err);
+      return null;
+    });
+}
+
+// 야간/비번 짝을 조회만 해요 (취소·확인처럼 뭔가 바꾸지 않고, 있는지/뭔지만 확인) - 수정 시
+// "짝이 있는지, 있다면 뭘 맞춰줘야 하는지" 판단하는 데 써요.
+function findNightPair(record) {
+  let pairDate = null;
+  let expectCompanion = null;
+  if (NIGHT_COMPANION_TYPE_MAP[record.vacationType]) {
+    pairDate = shiftDateStr_(record.date, 1);
+    expectCompanion = true;
+  } else if (NIGHT_COMPANION_TYPES_REVERSE[record.vacationType]) {
+    pairDate = shiftDateStr_(record.date, -1);
+    expectCompanion = false;
+  }
+  if (!pairDate) return Promise.resolve(null);
+  return window.VacationAPI.getByDate(pairDate, record.branch)
+    .then((records) => {
+      const pairRecord = (records || []).find(
+        (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
+      );
+      if (!pairRecord) return null;
+      const valid = expectCompanion
+        ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
+        : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType];
+      return valid ? pairRecord : null;
+    })
+    .catch((err) => {
+      console.error("짝 조회 실패:", err);
+      return null;
+    });
+}
+
 // activeRecords: 취소 아닌 전체 기록 (비번 감지는 전체 기록 대상)
 // prevDayActiveRecords: 전날의 취소 아닌 전체 기록 (전날 야간 신청으로 인한 비번 자리 자동 오픈 판별용)
 // branch: "경산" | "문양"
@@ -1349,7 +1850,7 @@ function cancelNightPairIfAny(record, onPairCancelled) {
 function gyeongsanCapacity(branch, dateStr, activeRecords, holidaySet, prevDayActiveRecords) {
   const table = GUARANTEE_BY_BRANCH[branch] || GUARANTEE_BY_BRANCH["경산"];
   let base = table[getDayType(dateStr, holidaySet)];
-  const hasOffDutyToday = activeRecords.some((r) => (r.dia || "").includes("비번"));
+  const hasOffDutyToday = activeRecords.some((r) => String(r.dia || "").includes("비번"));
   const hasNightFromYesterday = (prevDayActiveRecords || []).some((r) => isNightShiftCode(r.dia, branch));
   if (hasOffDutyToday || hasNightFromYesterday) base += 1;
   return base;
@@ -1389,7 +1890,7 @@ const TYPE_ICON = {
 // 보장인원에 포함되지 않는(휴충당 처리) 휴가 종류
 const NON_CAPACITY_TYPES = [
   "청휴", "청휴비", "청휴(탈상)", "병가", "병가비",
-  "노조", "공란", "교육", "출장", "교휴(공휴)",
+  "노조", "공란", "교육", "출장", "교휴(공휴)", "기타",
 ];
 
 const modal = {
@@ -1493,20 +1994,60 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   // 전체관리자 전용 - 실제 로그인/등록은 그대로 두고, 화면에 표시할 소속만 가상으로 바꿔치기 (Firestore 등록 불필요)
   const otherBranch = realCurrentUser.branch === "경산" ? "문양" : "경산";
   const [ghosting, setGhosting] = useState(false);
+  // 슈퍼관리자(권재림)는 "문양로 전환"처럼, "운용" 버튼으로 기관사↔운용 화면을 자유롭게 오갈 수 있어요.
+  // 운용으로 등록돼있지 않아도 이 토글로 운용 화면(대신 기록·확인·휴충당 관리 등)에 들어갈 수 있어요.
+  const [actingAsManager, setActingAsManager] = useState(false);
   const currentUser =
     isSuperAdmin && ghosting ? { ...realCurrentUser, branch: otherBranch } : realCurrentUser;
   const isAdmin = isAdminUser(currentUser);
-  const isMidManager = isMidManagerUser(currentUser, managers);
+  const isMidManager = isMidManagerUser(currentUser, managers) || (isSuperAdmin && actingAsManager);
   const [showAdmin, setShowAdmin] = useState(false);
   const [showManagerAdmin, setShowManagerAdmin] = useState(false);
   const [showImportTest, setShowImportTest] = useState(false);
   const [showMyVacations, setShowMyVacations] = useState(false);
   const [showLotteryAdmin, setShowLotteryAdmin] = useState(false); // 명절 추첨 관리 (관리자)
   const [showLotteryApply, setShowLotteryApply] = useState(false); // 명절 추첨 응모 (기관사)
+  const [showHyuchungdangAdmin, setShowHyuchungdangAdmin] = useState(false); // 휴충당 관리 (관리자, 경산 전용)
   const [showAdminMenu, setShowAdminMenu] = useState(false); // 관리자 메뉴 모음
+  const [showDataReset, setShowDataReset] = useState(false); // 데이터 초기화 (휴충당·문양, TEST_MODE와 무관하게 항상 노출)
+  const [lastBackupText, setLastBackupText] = useState("확인 중...");
+
+  // 관리자 메뉴를 열 때마다 마지막 백업 시각을 최신으로 다시 확인해요
+  useEffect(() => {
+    if (!showAdminMenu) return;
+    let cancelled = false;
+    waitForFirestore()
+      .then(() => {
+        if (!window.SystemAPI || typeof window.SystemAPI.getBackupMeta !== "function") {
+          throw new Error("no-system-api");
+        }
+        return window.SystemAPI.getBackupMeta();
+      })
+      .then((meta) => {
+        if (cancelled) return;
+        const ms = meta?.lastBackupAt?.toMillis ? meta.lastBackupAt.toMillis() : null;
+        if (!ms) {
+          setLastBackupText("아직 백업된 적 없어요");
+          return;
+        }
+        const diffDays = Math.floor((Date.now() - ms) / (24 * 60 * 60 * 1000));
+        const d = new Date(ms);
+        const dateStr = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        setLastBackupText(diffDays <= 0 ? `${dateStr} (오늘)` : `${dateStr} (${diffDays}일 전)`);
+      })
+      .catch(() => {
+        if (!cancelled) setLastBackupText("확인 실패");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showAdminMenu]);
+
+
   const [showEtiquetteNotice, setShowEtiquetteNotice] = useState(true); // 로그인할 때마다 한 번 안내
   const [upcomingUnconfirmed, setUpcomingUnconfirmed] = useState([]); // 5일 이내 & 아직 미확인인 내 신청 건
   const [lotteryResultsToShow, setLotteryResultsToShow] = useState([]); // 아직 확인 안 한 명절 추첨 결과
+  const [hyuchungdangResultsToShow, setHyuchungdangResultsToShow] = useState([]); // 아직 확인 안 한 휴충당 확정 결과
   const [branchUpcomingUnconfirmed, setBranchUpcomingUnconfirmed] = useState([]); // 운용용 - 소속 전체의 5일 이내 미확인 신청
   const [adjacentRecords, setAdjacentRecords] = useState({ prev: [], next: [] }); // 운용용 - 전날/다음날 요약
 
@@ -1657,8 +2198,14 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     }
   }, [selectedDate]);
 
-  const myCode = (employees || []).find((e) => e.id === currentUser.id)?.code || "";
-  const myBaseCode = (employees || []).find((e) => e.id === currentUser.id)?.baseCode || "";
+  // 본인 기록 찾기 - 이름+소속으로 우선 찾아요 (스프레드시트에서 "직원ID는 고정, 이름을 서로
+  // 바꿔서 자리를 교체하는" 운영 방식과 맞추기 위해서예요 - 교번앱도 이 방식으로 동작해요).
+  // 혹시 이름이 명단에서 아예 안 보이면 ID로도 한 번 더 찾아봐요 (최후의 안전장치).
+  const myRosterEntry =
+    (employees || []).find((e) => e.name === currentUser.name && e.branch === currentUser.branch) ||
+    (employees || []).find((e) => e.id === currentUser.id);
+  const myCode = myRosterEntry?.code || "";
+  const myBaseCode = myRosterEntry?.baseCode || "";
   const myTeamKey = REVERSE_TEAM_MAP[currentUser.branch];
   const myOrder = GYOBUN_ORDER[myTeamKey] || [];
 
@@ -1705,7 +2252,59 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   const [managerFormType, setManagerFormType] = useState(NON_CAPACITY_TYPES[0]);
   const [managerFormDia, setManagerFormDia] = useState("");
   const [managerFormNote, setManagerFormNote] = useState("");
+  const [managerFormOtherReason, setManagerFormOtherReason] = useState(""); // "기타" 선택 시 사유
+  const [managerFormUnassigned, setManagerFormUnassigned] = useState(false); // 대상자 미정으로 먼저 등록
   const [managerSaving, setManagerSaving] = useState(false);
+  // 휴충당 신청 (경산 전용) - 본인 교번이 "휴"로 시작하는 날짜에 한해, 언제든 신청 가능.
+  // 상태는 "신청중"/"취소됨" 두 가지만 써요. 확정 처리는 별도의 "휴충당 신청 현황" 달력에서 운용이 처리해요.
+  const [hyuchungdangByDate, setHyuchungdangByDate] = useState([]);
+  useEffect(() => {
+    if (!selectedDate) {
+      setHyuchungdangByDate([]);
+      return;
+    }
+    let cancelled = false;
+    waitForFirestore()
+      .then(() => window.HyuchungdangAPI.listByDate(selectedDate, currentUser.branch))
+      .then((list) => {
+        if (cancelled) return;
+        setHyuchungdangByDate((list || []).filter((r) => r.status === "신청중"));
+      })
+      .catch((err) => console.error("휴충당 신청 목록 조회 실패:", err));
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDate]);
+
+  const myHyuchungdangRequest = hyuchungdangByDate.find((r) => r.employeeId === currentUser.id);
+
+  const handleApplyHyuchungdang = () => {
+    if (!confirm(`${selectedDate}에 휴충당을 신청할까요?`)) return;
+    const id = `${currentUser.id}_${selectedDate}`;
+    const originalDia = codeForDate(selectedDate);
+    window.HyuchungdangAPI.request(id, {
+      employeeId: currentUser.id,
+      name: currentUser.name,
+      branch: currentUser.branch,
+      date: selectedDate,
+      originalDia,
+    })
+      .then(() => {
+        setHyuchungdangByDate((prev) => [
+          ...prev,
+          { id, employeeId: currentUser.id, name: currentUser.name, branch: currentUser.branch, date: selectedDate, originalDia, status: "신청중" },
+        ]);
+      })
+      .catch((err) => alert("신청 실패: " + (err && err.message ? err.message : err)));
+  };
+
+  const handleCancelHyuchungdang = (reqId) => {
+    if (!confirm("휴충당 신청을 취소할까요?")) return;
+    window.HyuchungdangAPI.cancel(reqId)
+      .then(() => setHyuchungdangByDate((prev) => prev.filter((r) => r.id !== reqId)))
+      .catch((err) => alert("취소 실패: " + (err && err.message ? err.message : err)));
+  };
+
   useEffect(() => {
     let cancelled = false;
     fetchHolidays(viewYear).then((set) => {
@@ -1715,26 +2314,89 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   }, [viewYear]);
 
   // 앱 접속(로그인) 시 한 번 - 본인이 신청한 것 중 5일 이내인데 아직 운용 확인 전인 건 알림
+  // (몇 년치 전체 이력이 아니라, 딱 "오늘~5일 후" 구간만 좁혀서 읽어와요 - 로그인마다 나가는
+  //  조회라 여기서 아끼는 게 누적 효과가 커요)
   useEffect(() => {
     if (isMidManager) return; // 운용은 본인이 확인 주체라 대상 아님
+    const today = todayStr();
+    const d = new Date(today + "T00:00:00");
+    d.setDate(d.getDate() + 5);
+    const limit = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getMine(currentUser.id))
+      .then(() => window.VacationAPI.getMineByRange(currentUser.id, today, limit))
       .then((records) => {
-        const today = todayStr();
-        const d = new Date(today + "T00:00:00");
-        d.setDate(d.getDate() + 5);
-        const limit = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
         const upcoming = (records || [])
-          .filter((v) => v.date >= today && v.date <= limit && v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
+          .filter((v) => v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
           .sort((a, b) => a.date.localeCompare(b.date));
         setUpcomingUnconfirmed(upcoming);
       })
       .catch((err) => console.error("확인 대기 알림 조회 실패:", err));
   }, [currentUser.id]);
 
-  // 앱 접속(로그인) 시 한 번 - 기관사, 오늘 추첨된 이벤트의 결과만 하루 동안 알림 (매너팝업 대신 단독으로)
+  // 1주일 1회 자동 백업 - 관리자/운용이 앱을 열 때마다 확인해서, 마지막 백업 이후 1주일(BACKUP_INTERVAL_MS)이
+  // 지났으면 그 시점에 전체 휴가 데이터를 스프레드시트("앱_자동백업" 탭)로 백업해요. 서버 스케줄러가
+  // 없는 구조라 "누군가 앱을 열 때 확인"하는 방식이에요. 새벽 1~4시(한국시간)에 누군가 접속하면
+  // 그때 우선 실행하고, 그 시간대를 계속 못 만나서 9일 이상 밀리면 시간 상관없이 강제 실행해요.
+  // ⚠️ 앱을 켜자마자 바로 실행하지 않고, 초기 화면(교번 등)이 다 자리잡은 뒤(15초 후)로 늦춰서
+  // 실행해요 - 교번 데이터는 이제 별도 캐시로 즉시 뜨긴 하지만, 혹시 모를 자원 경합을 피하려고요.
   useEffect(() => {
-    if (isMidManager) return;
+    if ((!isAdmin && !isMidManager) || currentUser.branch !== "경산") return;
+    const timer = setTimeout(() => {
+      waitForFirestore()
+        .then(() => window.SystemAPI.getBackupMeta())
+        .then((meta) => {
+          const lastMs = meta?.lastBackupAt?.toMillis ? meta.lastBackupAt.toMillis() : 0;
+          const overdueMs = Date.now() - lastMs;
+          if (overdueMs < BACKUP_INTERVAL_MS) return null; // 아직 1주일 안 지남
+          const hour = koreaCurrentHour();
+          const isPreferredWindow = hour >= BACKUP_PREFERRED_HOUR_START && hour < BACKUP_PREFERRED_HOUR_END;
+          const isForceOverdue = overdueMs >= BACKUP_FORCE_OVERDUE_MS;
+          if (!isPreferredWindow && !isForceOverdue) return null; // 새벽 시간대도 아니고 많이 밀리지도 않았으면 기다림
+          return window.VacationAPI.getAll(currentUser.branch).then((records) => {
+            const payload = (records || [])
+              .map((r) => ({
+                date: r.date || "",
+                name: r.name || "",
+                branch: r.branch || "",
+                employeeId: r.employeeId || "",
+                vacationType: r.vacationType || "",
+                dia: r.dia == null ? "" : String(r.dia),
+                status: r.status || "",
+                confirmedBy: r.confirmedBy || "",
+                priority: r.priority == null ? "" : r.priority,
+                // 신청일(YYYY-MM-DD) - "가져오기"에서 신청일을 읽던 것과 반대로, 나중에 이 백업을
+                // 다시 불러올(복구) 기능을 만들 때 그대로 재사용할 수 있도록 남겨둬요.
+                reqDate: r.createdAt ? formatEntryDateOnly(r.createdAt) : "",
+                note: r.note || "",
+                recordedBy: r.recordedBy || "",
+              }))
+              .sort((a, b) => {
+                if (a.date !== b.date) return a.date.localeCompare(b.date);
+                const pa = a.priority === "" ? Infinity : a.priority;
+                const pb = b.priority === "" ? Infinity : b.priority;
+                if (pa !== pb) return pa - pb;
+                return a.name.localeCompare(b.name, "ko");
+              });
+            return fetch(VACATION_API_URL, {
+              method: "POST",
+              headers: { "Content-Type": "text/plain;charset=utf-8" },
+              body: JSON.stringify({ action: "backup", records: payload }),
+            })
+              .then((res) => res.json())
+              .then((json) => {
+                if (!json || !json.ok) throw new Error((json && json.error) || "백업 실패");
+                return window.SystemAPI.markBackupDone();
+              });
+          });
+        })
+        .catch((err) => console.error("자동 백업 실패:", err));
+    }, 15000);
+    return () => clearTimeout(timer);
+  }, [currentUser.id, currentUser.branch, isAdmin, isMidManager]);
+
+  // 앱 접속(로그인) 시 한 번 - 경산 기관사, 오늘 추첨된 이벤트의 결과만 하루 동안 알림 (매너팝업 대신 단독으로)
+  useEffect(() => {
+    if (isMidManager || currentUser.branch !== "경산") return;
     waitForFirestore()
       .then(() => Promise.all([window.LotteryAPI.listEvents(), window.LotteryAPI.listMyEntries(currentUser.id)]))
       .then(([events, entries]) => {
@@ -1752,6 +2414,21 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       .catch((err) => console.error("명절 추첨 결과 조회 실패:", err));
   }, [currentUser.id]);
 
+  // 앱 접속(로그인) 시 한 번 - 경산 기관사, 운용이 확인까지 마친(=확정된) 휴충당 중
+  // 아직 그 전날(휴충당 날짜 하루 전) 자정이 지나지 않은 것만 알림. 한 번 닫아도
+  // 다음에 다시 들어오면 그 날짜가 되기 전까지는 계속 다시 떠요.
+  useEffect(() => {
+    if (isMidManager || currentUser.branch !== "경산") return;
+    const today = koreaTodayStr();
+    waitForFirestore()
+      .then(() => window.HyuchungdangAPI.listMineFrom(currentUser.id, today))
+      .then((list) => {
+        const results = (list || []).filter((r) => r.confirmedBy && r.status !== "취소됨");
+        setHyuchungdangResultsToShow(results);
+      })
+      .catch((err) => console.error("휴충당 확정 알림 조회 실패:", err));
+  }, [currentUser.id]);
+
   // 앱 접속(로그인) 시 한 번 - 운용용, 소속 전체에서 5일 이내인데 아직 미확인인 신청 알림
   useEffect(() => {
     if (!isMidManager) return;
@@ -1760,27 +2437,26 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     d.setDate(d.getDate() + 5);
     const limit = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getByRange(today, limit))
+      .then(() => window.VacationAPI.getByRange(today, limit, currentUser.branch))
       .then((records) => {
         const upcoming = (records || [])
-          .filter((v) => v.branch === currentUser.branch && v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
+          .filter((v) => v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
           .sort((a, b) => a.date.localeCompare(b.date));
         setBranchUpcomingUnconfirmed(upcoming);
       })
       .catch((err) => console.error("운용 확인 대기 알림 조회 실패:", err));
-  }, [currentUser.id, isMidManager]);
+  }, [currentUser.id, currentUser.branch, isMidManager]);
 
-  // 수동 새로고침용 (저장/취소/확인 등 액션 직후 즉시 반영하고 싶을 때 호출)
   const loadMonth = useCallback((y, m) => {
     setLoading(true);
     const start = `${y}-${pad2(m + 1)}-01`;
     const lastDay = new Date(y, m + 1, 0).getDate();
     const end = `${y}-${pad2(m + 1)}-${pad2(lastDay)}`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getByRange(start, end))
+      .then(() => window.VacationAPI.getByRange(start, end, currentUser.branch))
       .then((list) => {
         const map = {};
-        list.forEach((v) => {
+        (list || []).forEach((v) => {
           if (!map[v.date]) map[v.date] = [];
           map[v.date].push(v);
         });
@@ -1794,38 +2470,23 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         alert("데이터를 불러오지 못했어요: " + (err && err.message ? err.message : err));
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [currentUser.branch]);
 
-  // 보고 있는 달의 데이터를 실시간으로 구독 - 다른 사람이 신청/취소/확인하면 화면이 자동으로 갱신돼요
+  // 보고 있는 달이 바뀌거나(월 이동) 소속이 바뀌면(고스트모드 전환) 한 번만 다시 불러와요.
+  // (예전엔 실시간 구독(onSnapshot)이었는데, 무료 읽기 한도를 최대한 아끼려고
+  //  "켜놓은 동안 계속 감시"가 아니라 "필요할 때 한 번 조회"로 되돌렸어요.
+  //  다른 사람이 그 사이에 신청/취소해도 자동으로는 안 보이고, 화면을 나갔다 들어오거나
+  //  월을 넘겼다 다시 돌아오거나, 새로고침하면 그때 최신 상태로 반영돼요.
+  //  본인이 직접 신청/취소/확인한 건 각 처리 함수에서 즉시 화면에 반영하니 이 effect와 무관해요.
+  //  살짝(200ms) 지연을 둬서, ‹ › 를 빠르게 여러 번 눌러 여러 달을 휙휙 지나칠 때
+  //  지나친 중간 달들까지 전부 조회하지 않고 최종적으로 멈춘 달만 조회하게 해요.
+  //  최신성엔 전혀 영향 없고, 순전히 낭비되는 중간 요청만 없애는 거예요.)
   useEffect(() => {
-    let unsubscribe = null;
-    let cancelled = false;
-    setLoading(true);
-    const start = `${viewYear}-${pad2(viewMonth + 1)}-01`;
-    const lastDay = new Date(viewYear, viewMonth + 1, 0).getDate();
-    const end = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(lastDay)}`;
-
-    waitForFirestore().then(() => {
-      if (cancelled) return;
-      unsubscribe = window.VacationAPI.subscribeRange(start, end, (list) => {
-        const map = {};
-        list.forEach((v) => {
-          if (!map[v.date]) map[v.date] = [];
-          map[v.date].push(v);
-        });
-        Object.values(map).forEach((arr) =>
-          arr.sort((a, b) => (a.name || "").localeCompare(b.name || ""))
-        );
-        setMonthMap(map);
-        setLoading(false);
-      });
-    });
-
-    return () => {
-      cancelled = true;
-      if (unsubscribe) unsubscribe();
-    };
-  }, [viewYear, viewMonth]);
+    const timer = setTimeout(() => {
+      loadMonth(viewYear, viewMonth);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [viewYear, viewMonth, currentUser.branch, loadMonth]);
 
   const changeMonth = (delta) => {
     let y = viewYear;
@@ -1876,7 +2537,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   // 날짜 모달/사이드 패널(내 휴가현황·승인 관리·운용 인원·가져오기 테스트) 공통으로 쓰는 닫기 함수.
   // 뒤로가기 버튼을 눌러도 popstate 핸들러가 똑같이 처리해서, 항상 달력 화면으로 돌아가요.
   const closeModal = () => {
-    if (selectedDate || showAdmin || showManagerAdmin || showImportTest || showMyVacations || showLotteryAdmin || showLotteryApply || showAdminMenu) {
+    if (selectedDate || showAdmin || showManagerAdmin || showImportTest || showMyVacations || showLotteryAdmin || showLotteryApply || showHyuchungdangAdmin || showAdminMenu || showDataReset) {
       window.history.back();
     }
   };
@@ -1912,7 +2573,9 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       setShowMyVacations(false);
       setShowLotteryAdmin(false);
       setShowLotteryApply(false);
+      setShowHyuchungdangAdmin(false);
       setShowAdminMenu(false);
+      setShowDataReset(false);
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -1934,27 +2597,41 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       })()
     : null;
 
-  // 운용(중간관리자)만 - 전날/다음날 기록을 따로 불러와서 옆에 같이 보여줌 (월 경계 걱정 없이 직접 조회)
+  // 운용(중간관리자)만 - 전날/다음날 기록을 따로 옆에 보여줌.
+  // 이미 이번 달 데이터(monthMap)에 있는 날짜면 그걸 그대로 쓰고, 달 경계를 넘어가는 날짜만
+  // (예: 1일의 전날, 말일의 다음날) 서버에서 따로 조회해요 - 불필요한 중복 조회를 줄여요.
   useEffect(() => {
     if (!isMidManager || !isWideScreen || !selectedDate) {
       setAdjacentRecords({ prev: [], next: [] });
       return;
     }
+    const selectedMonth = selectedDate.slice(0, 7);
+    const prevInSameMonth = prevDateStr && prevDateStr.slice(0, 7) === selectedMonth;
+    const nextInSameMonth = nextDateStr && nextDateStr.slice(0, 7) === selectedMonth;
+
     let cancelled = false;
-    waitForFirestore()
-      .then(() =>
-        Promise.all([window.VacationAPI.getByDate(prevDateStr), window.VacationAPI.getByDate(nextDateStr)])
-      )
+    const prevPromise = prevInSameMonth
+      ? Promise.resolve((monthMap[prevDateStr] || []).filter((v) => v.branch === currentUser.branch))
+      : prevDateStr
+      ? waitForFirestore().then(() => window.VacationAPI.getByDate(prevDateStr, currentUser.branch))
+      : Promise.resolve([]);
+    const nextPromise = nextInSameMonth
+      ? Promise.resolve((monthMap[nextDateStr] || []).filter((v) => v.branch === currentUser.branch))
+      : nextDateStr
+      ? waitForFirestore().then(() => window.VacationAPI.getByDate(nextDateStr, currentUser.branch))
+      : Promise.resolve([]);
+
+    Promise.all([prevPromise, nextPromise])
       .then(([prevList, nextList]) => {
         if (cancelled) return;
         setAdjacentRecords({
-          prev: (prevList || []).filter((v) => v.branch === currentUser.branch),
-          next: (nextList || []).filter((v) => v.branch === currentUser.branch),
+          prev: prevList || [],
+          next: nextList || [],
         });
       })
       .catch((err) => console.error("전날/다음날 조회 실패:", err));
     return () => { cancelled = true; };
-  }, [selectedDate, isMidManager, isWideScreen]);
+  }, [selectedDate, isMidManager, isWideScreen, monthMap, currentUser.branch]);
 
   const dayRecords = selectedDate
     ? (monthMap[selectedDate] || []).filter((v) => v.branch === currentUser.branch)
@@ -2023,8 +2700,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   const handleCancel = (record) => {
     if (!confirm(`${record.name}님의 ${record.vacationType} 기록을 취소할까요?`)) return;
     window.VacationAPI.cancel(record.id).then(() => {
-      loadMonth(viewYear, viewMonth);
-      // 모달 내 목록도 즉시 갱신
+      // 모달 내 목록에 즉시 "취소됨" 표시 (순번 재정렬 전, 빠른 화면 반응용)
       setMonthMap((prev) => {
         const next = { ...prev };
         next[selectedDate] = (next[selectedDate] || []).map((v) =>
@@ -2032,8 +2708,33 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         );
         return next;
       });
-      // 야간/비번 짝이 있으면 반대쪽도 같이 취소
-      cancelNightPairIfAny(record, () => loadMonth(viewYear, viewMonth));
+      // 야간/비번 짝이 있으면 반대쪽도 같이 취소돼요 - 짝이 있는 그 날짜만 콕 집어서 화면에 반영해요
+      // (예전엔 여기서 달 전체를 다시 읽어왔는데, 짝 기록 하나 상태 바꾸는 데 그럴 필요가 없어요)
+      // 야간 쪽이 짝으로 같이 취소되면, 그날 순번에도 구멍이 생기니 그 날짜도 같이 순번 정리해요
+      // (아래 record.date 쪽 정리는 "직접 취소한 기록"의 날짜만 커버해서, 비번을 먼저 취소해
+      //  야간이 연쇄로 취소되는 경우엔 이게 없으면 야간 쪽 날짜 순번이 안 정리됐어요)
+      cancelNightPairIfAny(record, (pairRecord) => {
+        setMonthMap((prev) => {
+          const next = { ...prev };
+          const pairDate = pairRecord.date;
+          next[pairDate] = (next[pairDate] || []).map((v) =>
+            v.id === pairRecord.id ? { ...v, status: "취소됨" } : v
+          );
+          return next;
+        });
+        if (isCapacityType(pairRecord.vacationType)) {
+          renumberDayPriorities_(pairRecord.date, pairRecord.branch, (freshRecords) => {
+            setMonthMap((prev) => ({ ...prev, [pairRecord.date]: freshRecords }));
+          });
+        }
+      });
+      // 보장휴가면 그날 순번을 다시 매겨야 해요 - renumberDayPriorities_가 그 날짜 기록만
+      // 다시 읽어와서 monthMap에 반영해줘요 (역시 달 전체를 다시 읽을 필요 없음)
+      if (isCapacityType(record.vacationType)) {
+        renumberDayPriorities_(record.date || selectedDate, record.branch, (freshRecords) => {
+          setMonthMap((prev) => ({ ...prev, [record.date || selectedDate]: freshRecords }));
+        });
+      }
     });
   };
 
@@ -2085,32 +2786,11 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       .catch((err) => alert("메모 저장 실패: " + (err && err.message ? err.message : err)));
   };
 
-  // 삭제 등으로 생긴 순번 구멍을 없애기 위해, 특정 날짜의 남은 보장휴가 순번을 1번부터 다시 매김
+  // 삭제/취소 등으로 생긴 순번 구멍 정리 - 공용 함수를 불러다 쓰고, 화면(monthMap) 갱신만 여기서 해요
   const renumberDayPriorities = (dateStr, branch) => {
-    window.VacationAPI.getByDate(dateStr)
-      .then((records) => {
-        const capacityActive = (records || [])
-          .filter((v) => v.branch === branch && v.status !== "취소됨" && isCapacityType(v.vacationType))
-          .sort((a, b) => {
-            const pa = a.priority != null ? a.priority : Infinity;
-            const pb = b.priority != null ? b.priority : Infinity;
-            if (pa !== pb) return pa - pb;
-            return (a.name || "").localeCompare(b.name || "");
-          });
-        const updates = [];
-        capacityActive.forEach((v, idx) => {
-          const newPriority = idx + 1;
-          if (v.priority !== newPriority) {
-            updates.push(window.VacationAPI.update(v.id, { priority: newPriority }));
-          }
-        });
-        return Promise.all(updates).then(() => window.VacationAPI.getByDate(dateStr));
-      })
-      .then((freshRecords) => {
-        if (!freshRecords) return;
-        setMonthMap((prev) => ({ ...prev, [dateStr]: freshRecords }));
-      })
-      .catch((err) => console.error("순번 재정렬 실패:", err));
+    renumberDayPriorities_(dateStr, branch, (freshRecords) => {
+      setMonthMap((prev) => ({ ...prev, [dateStr]: freshRecords }));
+    });
   };
 
   const handleAdminDelete = (record) => {
@@ -2130,38 +2810,77 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     const companionType = NIGHT_COMPANION_TYPE_MAP[formType];
     const shouldAddCompanion =
       isNightFormEntry && companionType && nextDateStr && isCapacityType(formType);
+    const companionDocId = shouldAddCompanion ? `${currentUser.id}_${nextDateStr}` : null;
+    const savedDia = formDia.trim();
+    let companionSaved = false;
 
     window.VacationAPI.addOnce(docId, {
       name: currentUser.name,
       branch: currentUser.branch,
       employeeId: currentUser.id,
       vacationType: formType,
-      dia: formDia.trim(),
+      dia: savedDia,
       date: selectedDate,
       ...(priority != null ? { priority } : {}),
     })
       .then(() => {
         if (!shouldAddCompanion) return;
         // 야간 신청이면 다음날 "비번" 기록도 같이 자동 등록해요 (연차→연차비, 분지→분지비, 장재→장재비)
-        const companionDocId = `${currentUser.id}_${nextDateStr}`;
         return window.VacationAPI.addOnce(companionDocId, {
           name: currentUser.name,
           branch: currentUser.branch,
           employeeId: currentUser.id,
           vacationType: companionType,
-          dia: nightDiaToOffDutyDia(formDia.trim()),
+          dia: nightDiaToOffDutyDia(savedDia),
           date: nextDateStr,
-        }).catch((err) => {
-          console.error("비번 자동 등록 실패:", err);
-          alert(
-            "휴가는 저장됐지만, 다음날 비번 자동 등록에 실패했어요. 다음날에 직접 비번을 추가로 입력해주세요."
-          );
-        });
+        })
+          .then(() => {
+            companionSaved = true;
+          })
+          .catch((err) => {
+            console.error("비번 자동 등록 실패:", err);
+            alert(
+              "휴가는 저장됐지만, 다음날 비번 자동 등록에 실패했어요. 다음날에 직접 비번을 추가로 입력해주세요."
+            );
+          });
       })
       .then(() => {
         setShowRegisterForm(false);
         setFormDia("");
-        loadMonth(viewYear, viewMonth);
+        // 방금 저장한 기록(+성공한 경우 짝 비번)만 화면에 콕 집어 반영해요 - 달 전체를 다시 읽지 않아요
+        setMonthMap((prev) => {
+          const next = { ...prev };
+          next[selectedDate] = [
+            ...(next[selectedDate] || []),
+            {
+              id: docId,
+              name: currentUser.name,
+              branch: currentUser.branch,
+              employeeId: currentUser.id,
+              vacationType: formType,
+              dia: savedDia,
+              date: selectedDate,
+              status: "정상",
+              ...(priority != null ? { priority } : {}),
+            },
+          ];
+          if (companionSaved) {
+            next[nextDateStr] = [
+              ...(next[nextDateStr] || []),
+              {
+                id: companionDocId,
+                name: currentUser.name,
+                branch: currentUser.branch,
+                employeeId: currentUser.id,
+                vacationType: companionType,
+                dia: nightDiaToOffDutyDia(savedDia),
+                date: nextDateStr,
+                status: "정상",
+              },
+            ];
+          }
+          return next;
+        });
       })
       .catch((err) => {
         console.error(err);
@@ -2177,9 +2896,9 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     waitForFirestore()
       .then(() =>
         Promise.all([
-          window.VacationAPI.getByDate(selectedDate),
-          prevDateStr ? window.VacationAPI.getByDate(prevDateStr) : Promise.resolve([]),
-          isNightFormEntry && nextDateStr ? window.VacationAPI.getByDate(nextDateStr) : Promise.resolve([]),
+          window.VacationAPI.getByDate(selectedDate, currentUser.branch),
+          prevDateStr ? window.VacationAPI.getByDate(prevDateStr, currentUser.branch) : Promise.resolve([]),
+          isNightFormEntry && nextDateStr ? window.VacationAPI.getByDate(nextDateStr, currentUser.branch) : Promise.resolve([]),
         ])
       )
       .then(([freshDayRecords, prevDayRecords, nextDayRecords]) => {
@@ -2268,6 +2987,17 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         );
         return next;
       });
+      // 야간/비번 짝이 있으면 반대쪽도 같이 확인 처리 - 짝이 있는 그 날짜만 콕 집어 반영해요
+      confirmNightPairIfAny(record, managerName, (pairRecord) => {
+        setMonthMap((prev) => {
+          const next = { ...prev };
+          const pairDate = pairRecord.date;
+          next[pairDate] = (next[pairDate] || []).map((v) =>
+            v.id === pairRecord.id ? { ...v, confirmedBy: managerName } : v
+          );
+          return next;
+        });
+      });
     });
   };
 
@@ -2277,42 +3007,216 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     setManagerFormType(NON_CAPACITY_TYPES[0]);
     setManagerFormDia("");
     setManagerFormNote("");
+    setManagerFormOtherReason("");
+    setManagerFormUnassigned(false);
     setShowManagerForm(true);
   };
 
   const branchAllEmployees = employees.filter((e) => e.branch === currentUser.branch);
 
   const handleSubmitManagerRecord = () => {
-    const target = branchAllEmployees.find((e) => e.id === managerTargetId);
-    if (!target) {
-      alert("대상자를 선택해주세요");
-      return;
-    }
-    if (!managerFormDia.trim()) {
-      alert("DIA를 입력해주세요");
-      return;
-    }
-    setManagerSaving(true);
-    window.VacationAPI.add({
-      name: target.name,
-      branch: target.branch,
-      employeeId: target.id,
-      vacationType: managerFormType,
-      dia: managerFormDia.trim(),
+  const target = branchAllEmployees.find(
+    (e) => e.id === managerTargetId
+  );
+
+  // 대상자를 지정하는 경우에만 대상자 선택 확인
+  if (!managerFormUnassigned && !target) {
+    alert("대상자를 선택해주세요");
+    return;
+  }
+
+  // 대상자 미정이면 DIA도 미지정으로 자동 처리
+  // 대상자가 지정된 경우에는 DIA 선택 필수
+ if (!managerFormUnassigned && !managerFormDia.trim()) {
+  alert("DIA를 입력해주세요");
+  return;
+}
+
+if (managerFormType === "기타" && !managerFormOtherReason.trim()) {
+  alert("기타 사유를 입력해주세요");
+  return;
+}
+
+const finalVacationType =
+  managerFormType === "기타"
+    ? `기타: ${managerFormOtherReason.trim()}`
+    : managerFormType;
+
+// ★ 대상자 미정이면 이름과 DIA 모두 미지정
+const finalName = managerFormUnassigned
+  ? "미지정"
+  : target.name;
+
+const finalDia = managerFormUnassigned
+  ? "미지정"
+  : managerFormDia.trim();
+
+setManagerSaving(true);
+
+// 본인 신청과 동일한 방식으로 순번을 자동 부여해요 - 그날 그 소속의 보장휴가 기록 수(취소 포함)
+// 다음 번호로. "대상자 미정"이나 보장인원 미포함 항목(기타 등)은 순번 자체가 필요 없어요.
+const assignPriority = () => {
+  if (managerFormUnassigned || !isCapacityType(finalVacationType)) return Promise.resolve(null);
+  return window.VacationAPI.getByDate(selectedDate, currentUser.branch).then((dayRecords) => {
+    const count = (dayRecords || []).filter(
+      (v) => isCapacityType(v.vacationType)
+    ).length;
+    return count + 1;
+  });
+};
+
+// 야간 근무면 다음날 "비번" 기록도 자동으로 같이 등록해요 (본인 신청과 동일한 규칙).
+// 대상자 미정인 경우엔 실제 DIA가 없어서 야간 판단 자체가 불가능하니 건너뛰어요.
+const companionType = NIGHT_COMPANION_TYPE_MAP[finalVacationType];
+const shouldAddCompanion =
+  !managerFormUnassigned &&
+  companionType &&
+  nextDateStr &&
+  isCapacityType(finalVacationType) &&
+  isNightShiftCode(finalDia, currentUser.branch);
+
+assignPriority()
+  .then((priority) => {
+    const newRecord = {
+      name: finalName,
+      branch: currentUser.branch,
+      employeeId: managerFormUnassigned ? "" : target.id,
+      vacationType: finalVacationType,
+
+      // ★ 대상자 미정이면 미지정
+      dia: finalDia,
+
       date: selectedDate,
       recordedBy: currentUser.name,
+      ...(priority != null ? { priority } : {}),
+      ...(managerFormUnassigned ? { unassigned: true } : {}),
       ...(managerFormNote.trim() ? { note: managerFormNote.trim() } : {}),
+    };
+    return window.VacationAPI.add(newRecord).then((id) => ({ id, ...newRecord }));
+  })
+    .then((savedRecord) => {
+      if (!shouldAddCompanion) return { savedRecord, companionRecord: null };
+      const companionRecord = {
+        name: finalName,
+        branch: currentUser.branch,
+        employeeId: target.id,
+        vacationType: companionType,
+        dia: nightDiaToOffDutyDia(finalDia),
+        date: nextDateStr,
+        recordedBy: currentUser.name,
+      };
+      return window.VacationAPI.add(companionRecord)
+        .then((id) => {
+          return { savedRecord, companionRecord: { id, ...companionRecord } };
+        })
+        .catch((err) => {
+          console.error("비번 자동 등록 실패:", err);
+          alert(
+            "기록은 저장됐지만, 다음날 비번 자동 등록에 실패했어요. 다음날에 직접 비번을 추가로 입력해주세요."
+          );
+          return { savedRecord, companionRecord: null };
+        });
     })
+    .then(({ savedRecord, companionRecord }) => {
+      setShowManagerForm(false);
+      // 방금 등록한 기록(+성공한 경우 짝 비번)만 화면에 콕 집어 반영해요 - 달 전체를 다시 읽지 않아요
+      setMonthMap((prev) => {
+        const next = { ...prev };
+        next[selectedDate] = [...(next[selectedDate] || []), { ...savedRecord, status: "정상" }];
+        if (companionRecord) {
+          next[nextDateStr] = [...(next[nextDateStr] || []), { ...companionRecord, status: "정상" }];
+        }
+        return next;
+      });
+    })
+    .catch((err) => {
+      console.error(err);
+
+      alert(
+        "등록에 실패했어요: " +
+        (err && err.message
+          ? err.message
+          : err)
+      );
+    })
+    .finally(() => {
+      setManagerSaving(false);
+    });
+};
+  // "대상자 미정"으로 먼저 등록해둔 기록에, 나중에 실제 사람+DIA를 같이 배정해요.
+  // employeeId는 보안규칙상 수정이 안 돼서, 기존 기록을 지우고 그 내용 그대로 새로 등록하는 방식이에요.
+  const [assigningRecordId, setAssigningRecordId] = useState(null);
+  const [assignPersonId, setAssignPersonId] = useState("");
+  const [assignDia, setAssignDia] = useState("");
+
+  // 선택한 직원의 그 날짜 원래(평소) 교번을 자동으로 계산 - DIA 기본값 채워주기용
+  const codeForEmployeeOnDate = (empId, dateStr) => {
+    const emp = branchAllEmployees.find((e) => e.id === empId);
+    const teamKey = REVERSE_TEAM_MAP[currentUser.branch];
+    const order = GYOBUN_ORDER[teamKey] || [];
+    if (!emp || !BASE_DATE || !emp.baseCode || !order.length) return "";
+    const offset = diffDays_(BASE_DATE, dateStr);
+    return shiftCodeByDays_(order, emp.baseCode, offset);
+  };
+
+  const startAssigning = (record) => {
+    setAssigningRecordId(record.id);
+    setAssignPersonId("");
+    setAssignDia("");
+  };
+
+  const handleAssignPersonSelect = (record, personId) => {
+    setAssignPersonId(personId);
+    // 사람을 고르면, 그 사람의 그날 원래 교번을 DIA 기본값으로 자동으로 채워줘요 (원하면 아래에서 바꿀 수 있어요)
+    const autoDia = personId ? codeForEmployeeOnDate(personId, record.date) : "";
+    setAssignDia(autoDia || "");
+  };
+
+  const handleConfirmAssign = (record) => {
+    const target = branchAllEmployees.find((e) => e.id === assignPersonId);
+    if (!target) {
+      alert("사람을 선택해주세요");
+      return;
+    }
+    if (!assignDia.trim()) {
+      alert("DIA를 선택해주세요");
+      return;
+    }
+    if (!confirm(`${target.name}님 / ${assignDia}(으)로 배정할까요?`)) return;
+
+    window.VacationAPI.remove(record.id)
       .then(() => {
-        setShowManagerForm(false);
-        loadMonth(viewYear, viewMonth);
+        const newRecord = {
+          name: target.name,
+          branch: currentUser.branch,
+          employeeId: target.id,
+          vacationType: record.vacationType,
+          dia: assignDia.trim(),
+          date: record.date,
+          recordedBy: currentUser.name,
+          ...(record.note ? { note: record.note } : {}),
+        };
+        return window.VacationAPI.add(newRecord).then((id) => ({ id, ...newRecord }));
+      })
+      .then((savedRecord) => {
+        setAssigningRecordId(null);
+        setAssignPersonId("");
+        setAssignDia("");
+        // 지운 "미지정" 기록을 새로 배정된 기록으로 콕 집어 교체해요 - 달 전체를 다시 읽지 않아요
+        setMonthMap((prev) => {
+          const next = { ...prev };
+          const dateKey = savedRecord.date;
+          next[dateKey] = (next[dateKey] || [])
+            .filter((v) => v.id !== record.id)
+            .concat({ ...savedRecord, status: "정상" });
+          return next;
+        });
       })
       .catch((err) => {
         console.error(err);
-        alert("등록에 실패했어요: " + (err && err.message ? err.message : err));
-      })
-      .finally(() => setManagerSaving(false));
-  };
+        alert("배정에 실패했어요: " + (err && err.message ? err.message : err));
+    });
+};
 
   const touchStartX = useRef(null);
   const dayTouchStartX = useRef(null); // 날짜 상세 모달 스와이프용
@@ -2482,7 +3386,9 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                     >
                       <td style={{ ...tbl.td, padding: "6px 3px" }}>{v.priority != null ? v.priority : idx + 1}</td>
                       <td style={{ ...tbl.td, textAlign: "left", padding: "6px 3px" }}>
-                        {TYPE_ICON[v.vacationType] || "📌"} {v.name}
+                        <span style={{ color: v.unassigned ? "#e08a20" : undefined, fontWeight: v.unassigned ? 700 : undefined }}>
+                          {v.unassigned ? "🔔" : TYPE_ICON[v.vacationType] || "📌"} {v.name}
+                        </span>
                       </td>
                       <td style={{ ...tbl.td, textAlign: "left", padding: "6px 3px" }}>{v.vacationType}</td>
                       <td style={{ ...tbl.td, fontWeight: 700, color: "#1b3a5c", padding: "6px 3px" }}>{v.dia}</td>
@@ -2529,9 +3435,14 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                 내 휴가현황
               </button>
             )}
-            {!isMidManager && !ghosting && (
+            {currentUser.branch === "경산" && !isMidManager && !ghosting && (
               <button style={adminStyles.adminBtn} onClick={() => openPanel(setShowLotteryApply)}>
                 🎋 명절 응모
+              </button>
+            )}
+            {currentUser.branch === "경산" && isMidManager && !ghosting && (
+              <button style={adminStyles.adminBtn} onClick={() => openPanel(setShowHyuchungdangAdmin)}>
+                🔁 휴충당 신청 현황
               </button>
             )}
             {isAdmin && (
@@ -2547,12 +3458,37 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                 {ghosting ? `🔀 ${realCurrentUser.branch}로 복귀` : `🔀 ${otherBranch}로 전환`}
               </button>
             )}
+            {isSuperAdmin && (
+              <button
+                style={{ ...adminStyles.adminBtn, background: "#1a73e8", color: "#fff", borderColor: "#1a73e8" }}
+                onClick={() => setActingAsManager((v) => !v)}
+              >
+                {actingAsManager ? "🔧 기관사" : "🔧 운용"}
+              </button>
+            )}
           </div>
         </div>
         <div style={cal.navRow}>
           <button style={cal.navBtn} onClick={() => changeMonth(-1)}>‹</button>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
-            <div style={cal.monthTitle}>{viewYear}년 {viewMonth + 1}월</div>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <div style={cal.monthTitle}>{viewYear}년 {viewMonth + 1}월</div>
+              <button
+                title="최신 정보로 새로고침"
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  color: "#cfe0ff",
+                  fontSize: "15px",
+                  cursor: "pointer",
+                  padding: "2px",
+                }}
+                disabled={loading}
+                onClick={() => loadMonth(viewYear, viewMonth, true)}
+              >
+                🔄
+              </button>
+            </div>
             {(viewYear !== now.getFullYear() || viewMonth !== now.getMonth()) && (
               <button
                 style={{
@@ -2616,11 +3552,15 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
           const remain = capacity - capacityCount;
           const badge = <div style={cal.dayBadge(gyeongsanColor(remain))}>{activeRecords.length}</div>;
 
+          const rawCodeForCell = codeForDate(key);
+          const sLabelForCell = getSLabelOnly(currentUser.branch, key, rawCodeForCell, holidaySet);
           return (
             <div key={i} style={cal.dayCell(key === todayKey)} onClick={() => openDate(d)}>
               <div style={cal.dayNum(dayType)}>{d}</div>
               <div style={cal.dayDivider} />
-              <div style={cal.dayCode(dayType)}>{codeForDate(key)}</div>
+              <div style={{ ...cal.dayCode(dayType), fontSize: sLabelForCell ? "10px" : cal.dayCode(dayType).fontSize }}>
+                {sLabelForCell ? `${rawCodeForCell}(${sLabelForCell})` : rawCodeForCell}
+              </div>
               {badge}
             </div>
           );
@@ -2749,20 +3689,44 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                 <div style={{ ...modal.countText, marginBottom: "20px" }}>중간관리자({currentUser.name}) 기록</div>
 
                 <div style={modal.formRow}>
-                  <label style={modal.label}>대상자</label>
-                  <select
-                    style={modal.input}
-                    value={managerTargetId}
-                    onChange={(e) => setManagerTargetId(e.target.value)}
+                  <label
+                    style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "13px", color: "#555", marginBottom: "8px", cursor: "pointer" }}
                   >
-                    <option value="">이름 선택</option>
-                    {[...branchAllEmployees]
-                      .sort((a, b) => a.name.localeCompare(b.name, "ko"))
-                      .map((emp) => (
-                        <option key={emp.id} value={emp.id}>{emp.name}</option>
-                      ))}
-                  </select>
+                    <input
+                      type="checkbox"
+                      checked={managerFormUnassigned}
+                      onChange={(e) => {
+                        setManagerFormUnassigned(e.target.checked);
+                        if (e.target.checked) setManagerTargetId("");
+                      }}
+                    />
+                    대상자 미정으로 먼저 등록 (시운전 등 - 나중에 사람 배정)
+                  </label>
                 </div>
+
+                {!managerFormUnassigned && (
+                  <div style={modal.formRow}>
+                    <label style={modal.label}>대상자</label>
+                    <select
+                      style={modal.input}
+                      value={managerTargetId}
+                      onChange={(e) => {
+                        const empId = e.target.value;
+                        setManagerTargetId(empId);
+                        // 대상자를 고르면 그 사람 본인의 오늘 교번을 자동으로 채워줘요 - 운용이 매번
+                        // 목록에서 그 사람 교번을 따로 찾아 고를 필요 없게. 물론 그 뒤에 자유롭게 바꿀 수 있어요.
+                        setManagerFormDia(empId ? codeForEmployeeOnDate(empId, selectedDate) : "");
+                      }}
+                    >
+                      <option value="">이름 선택</option>
+                      {[...branchAllEmployees]
+                        .sort((a, b) => a.name.localeCompare(b.name, "ko"))
+                        .map((emp) => (
+                          <option key={emp.id} value={emp.id}>{emp.name}</option>
+                        ))}
+                    </select>
+                  </div>
+                )}
 
                 <div style={modal.formRow}>
                   <label style={modal.label}>휴가명</label>
@@ -2784,6 +3748,18 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                   </select>
                 </div>
 
+                {managerFormType === "기타" && (
+                  <div style={modal.formRow}>
+                    <label style={modal.label}>기타 사유</label>
+                    <input
+                 style={modal.input}
+                      value={managerFormOtherReason}
+                      onChange={(e) => setManagerFormOtherReason(e.target.value)}
+                      placeholder="예: 예비군훈련, 법원 출석 등"
+                    />
+                  </div>
+                )}
+
                 <div style={modal.formRow}>
                   <label style={modal.label}>DIA</label>
                   <select
@@ -2792,6 +3768,9 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                     onChange={(e) => setManagerFormDia(e.target.value)}
                   >
                     <option value="">교번을 선택해주세요</option>
+                    {managerFormDia && !managerBranchCodes.includes(managerFormDia) && (
+                      <option value={managerFormDia}>{managerFormDia} (본인 교번)</option>
+                    )}
                     {managerBranchCodes.map((c) => (
                       <option key={c} value={c}>{c}</option>
                     ))}
@@ -2817,7 +3796,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
               <React.Fragment>
                 <div style={{ ...modal.dateTitle, color: dateHeaderColor(selectedDate, holidaySet) }}>{formatDateHeader(selectedDate)} 휴가 신청</div>
                 <div style={{ ...modal.countText, marginBottom: "20px" }}>
-                  {currentUser.name}님 이름으로 등록돼요 · 내 교번: <strong>{codeForDate(selectedDate) || "-"}</strong>
+                  {currentUser.name}님 이름으로 등록돼요 · 내 교번: <strong>{withSLabel(currentUser.branch, selectedDate, codeForDate(selectedDate), holidaySet) || "-"}</strong>
                 </div>
 
                 <div style={modal.formRow}>
@@ -2843,12 +3822,16 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
                 <div style={modal.formRow}>
                   <label style={modal.label}>DIA</label>
-                  <input
+                  <select
                     style={modal.input}
                     value={formDia}
                     onChange={(e) => setFormDia(e.target.value)}
-                    placeholder="예: 22, 대1, 27~"
-                  />
+                  >
+                    <option value="">교번을 선택해주세요</option>
+                    {managerBranchCodes.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
                   {currentUser.branch === "경산" &&
                     isThreeRoundTripCode(selectedDate, formDia, holidaySet) && (
                       <div style={{ fontSize: "12px", marginTop: "6px", color: "#e08a20", fontWeight: 600 }}>
@@ -2887,10 +3870,34 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                         ›
                       </button>
                     </div>
-                    <div style={{ fontSize: "12px", color: "#1a1a1a", fontWeight: 600 }}>
+                    <div style={{ fontSize: "12px", color: "#1a1a1a", fontWeight: 600, display: "flex", alignItems: "center", gap: "8px" }}>
                       휴가자 {activeCount}명
                       {gyeongsanInfo &&
                         ` · 보장대상 ${gyeongsanInfo.capacityCount}/${gyeongsanInfo.capacity}명 (여유 ${gyeongsanInfo.remain}명)`}
+                      {isMidManager && (
+                        <button
+                          type="button"
+                          style={{
+                            color: "#1a73e8",
+                            fontWeight: 700,
+                            background: "none",
+                            border: "none",
+                            padding: 0,
+                            fontFamily: "inherit",
+                            textDecoration: "underline",
+                            cursor: "pointer",
+                            userSelect: "none",
+                            WebkitUserSelect: "none",
+                          }}
+                          onClick={() =>
+                            renumberDayPriorities_(selectedDate, currentUser.branch, (freshRecords) => {
+                              setMonthMap((prev) => ({ ...prev, [selectedDate]: freshRecords }));
+                            })
+                          }
+                        >
+                          🔄 순번 정리
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}
@@ -2911,14 +3918,39 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                         ›
                       </button>
                     </div>
-                    <div style={{ ...modal.countText, marginBottom: "4px" }}>
+                    <div style={{ ...modal.countText, marginBottom: "4px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                       휴가자 {activeCount}명
                       {gyeongsanInfo &&
                         ` · 보장대상 ${gyeongsanInfo.capacityCount}/${gyeongsanInfo.capacity}명 (여유 ${gyeongsanInfo.remain}명)`}
+                      {isMidManager && (
+                        <button
+                          type="button"
+                          style={{
+                            color: "#1a73e8",
+                            fontWeight: 700,
+                            fontSize: "12px",
+                            background: "none",
+                            border: "none",
+                            padding: 0,
+                            fontFamily: "inherit",
+                            textDecoration: "underline",
+                            cursor: "pointer",
+                            userSelect: "none",
+                            WebkitUserSelect: "none",
+                          }}
+                          onClick={() =>
+                            renumberDayPriorities_(selectedDate, currentUser.branch, (freshRecords) => {
+                              setMonthMap((prev) => ({ ...prev, [selectedDate]: freshRecords }));
+                            })
+                          }
+                        >
+                          🔄 순번 정리
+                        </button>
+                      )}
                     </div>
                     {!isMidManager && (
                       <div style={{ fontSize: "13px", color: "#1b3a5c", fontWeight: 700, marginTop: "2px", marginBottom: "6px" }}>
-                        내 교번: {codeForDate(selectedDate) || "-"}
+                        내 교번: {withSLabel(currentUser.branch, selectedDate, codeForDate(selectedDate), holidaySet) || "-"}
                       </div>
                     )}
                   </React.Fragment>
@@ -3010,19 +4042,81 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                                 )}
                               </td>
                               <td style={{ ...tbl.td, textAlign: "left" }}>
-                                <div style={{ fontWeight: 700, fontSize: "13px" }}>
-                                  {TYPE_ICON[v.vacationType] || "📌"} {v.name}
+                                <div style={{ fontWeight: 700, fontSize: "13px", color: v.unassigned ? "#e08a20" : undefined }}>
+                                  {v.unassigned ? "🔔" : TYPE_ICON[v.vacationType] || "📌"} {v.name}
                                 </div>
+                                {v.unassigned && isMidManager && (
+                                  assigningRecordId === v.id ? (
+                                    <div
+                                      style={{
+                                        marginTop: "4px",
+                                        padding: "8px",
+                                        background: "#fff7e6",
+                                        border: "1px solid #f5cf7a",
+                                        borderRadius: "8px",
+                                        display: "flex",
+                                        flexDirection: "column",
+                                        gap: "4px",
+                                        maxWidth: "150px",
+                                      }}
+                                    >
+                                      <select
+                                        value={assignPersonId}
+                                        onChange={(e) => handleAssignPersonSelect(v, e.target.value)}
+                                        style={{ fontSize: "11px", padding: "3px" }}
+                                        autoFocus
+                                      >
+                                        <option value="">사람 선택</option>
+                                        {[...branchAllEmployees]
+                                          .sort((a, b) => a.name.localeCompare(b.name, "ko"))
+                                          .map((emp) => (
+                                            <option key={emp.id} value={emp.id}>{emp.name}</option>
+                                          ))}
+                                      </select>
+                                      <select
+                                        value={assignDia}
+                                        onChange={(e) => setAssignDia(e.target.value)}
+                                        style={{ fontSize: "11px", padding: "3px" }}
+                                      >
+                                        <option value="">DIA 선택</option>
+                                        {managerBranchCodes.map((c) => (
+                                          <option key={c} value={c}>{c}</option>
+                                        ))}
+                                      </select>
+                                      <div style={{ display: "flex", gap: "4px" }}>
+                                        <button
+                                          style={{ ...modal.smallCancelBtn, margin: 0, flex: 1, color: "#1caa5c" }}
+                                          onClick={() => handleConfirmAssign(v)}
+                                        >
+                                          확정
+                                        </button>
+                                        <button
+                                          style={{ ...modal.smallCancelBtn, margin: 0, flex: 1 }}
+                                          onClick={() => setAssigningRecordId(null)}
+                                        >
+                                          취소
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <span
+                                      style={{ fontSize: "11px", color: "#e08a20", textDecoration: "underline", cursor: "pointer" }}
+                                      onClick={() => startAssigning(v)}
+                                    >
+                                      배정하기
+                                    </span>
+                                  )
+                                )}
                                 {v.createdAt && (
                                   <div style={{ fontSize: "12px", color: "#333" }}>
-                                    {formatEntryTime(v.createdAt)}
+                                    {formatEntryTime(v.createdAt, v.createdAtDateOnly)}
                                   </div>
                                 )}
                               </td>
                               <td style={{ ...tbl.td, textAlign: "left" }}>
                                 {v.vacationType}
                               </td>
-                              <td style={{ ...tbl.td, fontWeight: 700, color: "#1b3a5c" }}>{v.dia}</td>
+                              <td style={{ ...tbl.td, fontWeight: 700, color: v.unassigned ? "#e08a20" : "#1b3a5c" }}>{v.dia}</td>
                               <td style={{ ...tbl.td, textAlign: "left" }}>
                                 {cancelled ? (
                                   "-"
@@ -3167,6 +4261,34 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
                     + 대신 기록 (병가·청휴·교육 등)
                   </button>
                 )}
+                {!isMidManager && !ghosting && currentUser.branch === "경산" && String(codeForDate(selectedDate) || "").startsWith("휴") && (
+                  myHyuchungdangRequest ? (
+                    <div
+                      style={{
+                        textAlign: "center",
+                        fontSize: "13px",
+                        padding: "10px 0",
+                        color: "#e08a20",
+                        fontWeight: 600,
+                      }}
+                    >
+                      🔁 휴충당 신청 완료{" "}
+                      <span
+                        style={{ color: "#e02020", textDecoration: "underline", cursor: "pointer", fontWeight: 400 }}
+                        onClick={() => handleCancelHyuchungdang(myHyuchungdangRequest.id)}
+                      >
+                        신청취소
+                      </span>
+                    </div>
+                  ) : (
+                    <button
+                      style={{ ...modal.addBtn, background: "#e08a20", marginTop: "6px" }}
+                      onClick={handleApplyHyuchungdang}
+                    >
+                      🔁 휴충당 신청
+                    </button>
+                  )
+                )}
                 <button style={modal.closeBtn} onClick={closeModal}>닫기</button>
               </React.Fragment>
             )}
@@ -3213,6 +4335,20 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         <div style={modal.overlay} onClick={closeModal}>
           <div style={{ ...modal.sheet, maxWidth: "340px" }} onClick={(e) => e.stopPropagation()}>
             <div style={modal.dateTitle}>⚙️ 관리자 메뉴</div>
+            {currentUser.branch === "경산" && (
+              <div
+                style={{
+                  background: "#f8f9fb",
+                  borderRadius: "10px",
+                  padding: "8px 12px",
+                  marginBottom: "14px",
+                  fontSize: "12px",
+                  color: "#666",
+                }}
+              >
+                📤 마지막 백업: <strong style={{ color: "#1b3a5c" }}>{lastBackupText}</strong>
+              </div>
+            )}
             <button
               style={styles.button}
               onClick={() => {
@@ -3231,34 +4367,118 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
             >
               운용 인원
             </button>
+            {currentUser.branch === "경산" && (
+              <button
+                style={styles.button}
+                onClick={() => {
+                  setShowAdminMenu(false);
+                  openPanel(setShowLotteryAdmin);
+                }}
+              >
+                🎋 명절 추첨 관리
+              </button>
+            )}
+            {TEST_MODE && (
+              <button
+                style={styles.button}
+                onClick={() => {
+                  setShowAdminMenu(false);
+                  openPanel(setShowImportTest);
+                }}
+              >
+                가져오기 테스트
+              </button>
+            )}
             <button
-              style={styles.button}
+              style={{ ...styles.button, border: "1px dashed #e08a20", color: "#e08a20" }}
               onClick={() => {
                 setShowAdminMenu(false);
-                openPanel(setShowLotteryAdmin);
+                openPanel(setShowDataReset);
               }}
             >
-              🎋 명절 추첨 관리
+              🗑️ 데이터 초기화
             </button>
             <button style={modal.closeBtn} onClick={closeModal}>닫기</button>
           </div>
         </div>
       )}
 
-      {showAdmin && <AdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} employees={employees} managers={managers} />}
+      {showAdmin && (
+        <ErrorBoundary onClose={closeModal}>
+          <AdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} employees={employees} managers={managers} />
+        </ErrorBoundary>
+      )}
       {showManagerAdmin && (
-        <ManagerAdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} />
+        <ErrorBoundary onClose={closeModal}>
+          <ManagerAdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} />
+        </ErrorBoundary>
+      )}
+      {showDataReset && (
+        <ErrorBoundary onClose={closeModal}>
+          <DataResetPanel onClose={closeModal} branch={currentUser.branch} isSuperAdmin={isSuperAdmin} />
+        </ErrorBoundary>
+      )}
+      {showImportTest && (
+        <ErrorBoundary onClose={closeModal}>
+          <ImportTestPanel onClose={closeModal} employees={employees} managers={managers} />
+        </ErrorBoundary>
       )}
       {showMyVacations && (
-        <MyVacationsPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
+        <ErrorBoundary onClose={closeModal}>
+          <MyVacationsPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
+        </ErrorBoundary>
       )}
       {showLotteryAdmin && (
-        <LotteryAdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
+        <ErrorBoundary onClose={closeModal}>
+          <LotteryAdminPanel branch={currentUser.branch} isSuperAdmin={isSuperAdmin} onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
+        </ErrorBoundary>
       )}
       {showLotteryApply && (
-        <LotteryApplyPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
+        <ErrorBoundary onClose={closeModal}>
+          <LotteryApplyPanel currentUser={currentUser} onClose={closeModal} employees={employees} />
+        </ErrorBoundary>
       )}
-      {showEtiquetteNotice && !isMidManager && lotteryResultsToShow.length > 0 && (
+      {showHyuchungdangAdmin && (
+        <ErrorBoundary onClose={closeModal}>
+          <HyuchungdangAdminPanel branch={currentUser.branch} onClose={closeModal} employees={employees} managers={managers} holidaySet={holidaySet} />
+        </ErrorBoundary>
+      )}
+      {!isMidManager && hyuchungdangResultsToShow.length > 0 && (
+        <div style={{ ...modal.overlay, alignItems: "safe center", justifyContent: "center" }}>
+          <div style={{ ...modal.sheet, maxWidth: "340px", borderRadius: "16px", textAlign: "center" }}>
+            <div style={{ fontSize: "26px", marginBottom: "10px" }}>🔁</div>
+            <div style={{ fontSize: "15px", fontWeight: 700, marginBottom: "12px" }}>
+              휴충당이 확정됐어요
+            </div>
+            <div style={{ textAlign: "left" }}>
+              {hyuchungdangResultsToShow.map((r) => (
+                <div
+                  key={r.id}
+                  style={{
+                    background: "#fff7e6",
+                    border: "1px solid #f5cf7a",
+                    borderRadius: "10px",
+                    padding: "10px 12px",
+                    marginBottom: "8px",
+                    fontSize: "13px",
+                  }}
+                >
+                  {r.name}기관사님, {r.date} ({weekdayShort(r.date)}) {r.originalDia}이(가){" "}
+                  <span style={{ fontWeight: 700, color: "#e08a20" }}>{r.substituteDia}</span>로 휴충당 확정
+                  되었습니다.
+                </div>
+              ))}
+            </div>
+            <button
+              style={modal.closeBtn}
+              onClick={() => setHyuchungdangResultsToShow([])}
+            >
+              확인
+            </button>
+          </div>
+        </div>
+      )}
+      {showEtiquetteNotice && !isMidManager && hyuchungdangResultsToShow.length === 0 && lotteryResultsToShow.length > 0 && (
         <div style={{ ...modal.overlay, alignItems: "safe center", justifyContent: "center" }}>
           <div style={{ ...modal.sheet, maxWidth: "340px", borderRadius: "16px", textAlign: "center" }}>
             <div style={{ fontSize: "26px", marginBottom: "10px" }}>🎋</div>
@@ -3290,7 +4510,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
         </div>
       )}
 
-      {showEtiquetteNotice && !isMidManager && lotteryResultsToShow.length === 0 && (
+      {showEtiquetteNotice && !isMidManager && hyuchungdangResultsToShow.length === 0 && lotteryResultsToShow.length === 0 && (
         <div style={{ ...modal.overlay, alignItems: "safe center", justifyContent: "center" }}>
           <div style={{ ...modal.sheet, maxWidth: "340px", borderRadius: "16px", textAlign: "center" }}>
             <div style={{ fontSize: "26px", marginBottom: "10px" }}>🙏</div>
@@ -3424,7 +4644,6 @@ const ADMIN_NAMES = [
   { name: "권재림", branch: "경산" },
   { name: "권세환", branch: "경산" },
   { name: "권재림", branch: "문양" },
-  { name: "오재욱", branch: "문양" },
 ];
 
 // 이름뿐 아니라 소속까지 같아야 관리자로 인정 (다른 소속 동명이인 방지)
@@ -3433,10 +4652,17 @@ function isAdminUser(user) {
   return ADMIN_NAMES.some((a) => a.name === user.name && a.branch === user.branch);
 }
 
-// 전체관리자(앱 총괄) - 소속과 무관하게 모든 소속의 승인관리·운용인원·명절추첨을 볼 수 있어요.
+// 전체관리자(앱 총괄) - 소속과 무관하게 모든 소속의 승인관리·운용인원·명절추첨을 볼 수 있고,
+// 운용 등록 여부와 무관하게 운용 화면(대신 기록·확인·휴충당 관리 등)에도 자유롭게 접근할 수 있어요.
 // 로그인은 평소처럼 한 소속으로 하되, 관리 화면 안에서 소속을 전환(고스트 모드)할 수 있어요.
+//
+// ⚠️ 나중에 안정화되면 이 SUPER_ADMIN_CROSS_BRANCH 한 줄만 false로 바꾸면 깔끔하게 종료돼요.
+// (TEST_MODE와 같은 방식) - 꺼지면 "🔀 전환" 버튼, 관리 화면의 소속 탭, 운용 자동부여가
+// 전부 자동으로 사라지고, 권재림님도 평소처럼 본인 소속(경산)에만 묶여요.
+const SUPER_ADMIN_CROSS_BRANCH = true;
 const SUPER_ADMIN_NAMES = ["권재림"];
 function isSuperAdminUser(user) {
+  if (!SUPER_ADMIN_CROSS_BRANCH) return false;
   if (!user) return false;
   return SUPER_ADMIN_NAMES.includes(user.name);
 }
@@ -3518,6 +4744,8 @@ const adminStyles = {
 function MyVacationsPanel({ currentUser, onClose, employees }) {
   const [list, setList] = useState([]);
   const [yearStats, setYearStats] = useState([]); // 올해 종류별 보장휴가 사용 개수
+  const [hyuchungdangList, setHyuchungdangList] = useState([]); // 내가 신청한 휴충당 목록 (경산 전용, 신청중+취소됨 둘 다)
+  const [hyuchungdangConfirmedCount, setHyuchungdangConfirmedCount] = useState(0); // 올해 확정 휴충당 개수
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState(null); // 휴가종류 수정 중인 기록 id
   const [editType, setEditType] = useState("");
@@ -3536,18 +4764,43 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
 
   const load = () => {
     setLoading(true);
+    const today = todayStr();
+    const currentYear = today.slice(0, 4);
+    // 실제로 쓰는 범위는 "올해 1월 1일부터"뿐이라(작년 이전 데이터는 이 화면에서 안 씀),
+    // 그만큼만 좁혀서 읽어와요. 미래 신청도 보여줘야 해서 위쪽은 넉넉하게 내년 말까지 열어둬요.
+    const fromDate = `${currentYear}-01-01`;
+    const toDate = `${parseInt(currentYear, 10) + 1}-12-31`;
+    const dayBeforeThisYear = `${parseInt(currentYear, 10) - 1}-12-31`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getMine(currentUser.id))
-      .then((records) => {
-        const today = todayStr();
+      .then(() =>
+        Promise.all([
+          window.VacationAPI.getMineByRange(currentUser.id, fromDate, toDate),
+          currentUser.branch === "경산"
+            ? window.HyuchungdangAPI.listMineFrom(currentUser.id, dayBeforeThisYear)
+            : Promise.resolve([]),
+        ])
+      )
+      .then(([records, hyuchungdangRecords]) => {
         const upcoming = records
           .filter((v) => v.date >= today && isCapacityType(v.vacationType))
           .sort((a, b) => a.date.localeCompare(b.date));
         setList(upcoming);
 
+        // 오늘 이후 신청 내역만 (신청중/취소됨 둘 다 - 취소된 건 취소선으로 계속 보여줌)
+        setHyuchungdangList(
+          (hyuchungdangRecords || [])
+            .filter((r) => r.date >= today)
+            .sort((a, b) => a.date.localeCompare(b.date))
+        );
+
+        // 올해 확정(충당교번+확인까지 마친) 휴충당 개수
+        const confirmedCount = (hyuchungdangRecords || []).filter(
+          (r) => r.date.startsWith(currentYear) && r.status !== "취소됨" && r.confirmedBy
+        ).length;
+        setHyuchungdangConfirmedCount(confirmedCount);
+
         // 올해(1월 1일부터) 보장휴가만, 취소되지 않은 것만 종류별로 집계
         // 단, 연차비/분지비/장재비는 야간근무 시 다음날에 같이 기록되는 것일 뿐 실제 사용 개수는 아니라서 집계에서 제외해요
-        const currentYear = today.slice(0, 4);
         const NIGHT_SHIFT_COMPANION_TYPES = ["연차비", "분지비", "장재비"];
         const counts = {};
         records
@@ -3572,6 +4825,15 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
     load();
   }, []);
 
+  const handleCancelMyHyuchungdang = (reqId) => {
+    if (!confirm("휴충당 신청을 취소할까요?")) return;
+    window.HyuchungdangAPI.cancel(reqId)
+      .then(() => {
+        setHyuchungdangList((prev) => prev.map((r) => (r.id === reqId ? { ...r, status: "취소됨" } : r)));
+      })
+      .catch((err) => alert("취소 실패: " + (err && err.message ? err.message : err)));
+  };
+
   const handleCancelMine = (record) => {
     const check = checkSelfCancelAllowed(currentUser.branch, record);
     if (!check.ok) {
@@ -3581,6 +4843,10 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
     if (!confirm(`${record.date} ${record.vacationType} 기록을 취소할까요?`)) return;
     window.VacationAPI.cancel(record.id).then(() => {
       setList((prev) => prev.map((v) => (v.id === record.id ? { ...v, status: "취소됨" } : v)));
+      // 취소로 순번에 구멍이 생기니, 같은 날짜의 남은 보장휴가 기록들 순번을 다시 매겨요
+      if (isCapacityType(record.vacationType)) {
+        renumberDayPriorities_(record.date, record.branch);
+      }
       // 야간/비번 짝이 있으면 반대쪽도 같이 취소 (이 목록에 있으면 화면도 같이 갱신)
       cancelNightPairIfAny(record, (pairRecord) => {
         setList((prev) =>
@@ -3588,28 +4854,72 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
             ? prev.map((v) => (v.id === pairRecord.id ? { ...v, status: "취소됨" } : v))
             : prev
         );
+        // 짝(주로 야간 쪽) 날짜도 순번에 구멍이 생기니 같이 정리해요
+        if (isCapacityType(pairRecord.vacationType)) {
+          renumberDayPriorities_(pairRecord.date, pairRecord.branch);
+        }
       });
     });
   };
 
   const handleStartEdit = (record) => {
+    // 비번(연차비 등)은 야간 신청에 딸려 자동 생성된 기록이라, 직접 수정하게 두면 야간 쪽과 어긋날 수 있어요.
+    // 야간 쪽을 수정하면 비번도 자동으로 같이 맞춰지니, 여기서는 야간 기록을 수정해달라고 안내해요.
+    if (NIGHT_COMPANION_TYPES_REVERSE[record.vacationType]) {
+      alert("이 기록은 야간 신청에 따라 자동 등록된 비번이에요. 전날 야간 기록을 수정하면 이 비번도 같이 바뀌어요.");
+      return;
+    }
     setEditingId(record.id);
     setEditType(record.vacationType);
     setEditDia(record.dia || "");
   };
 
   const handleSaveTypeEdit = (record) => {
-    if (editType === record.vacationType && editDia === (record.dia || "")) {
+    const trimmedDia = editDia.trim();
+    if (editType === record.vacationType && trimmedDia === (record.dia || "")) {
       setEditingId(null);
       return;
     }
     setEditSaving(true);
-    window.VacationAPI.update(record.id, { vacationType: editType, dia: editDia.trim() })
-      .then(() => {
+    findNightPair(record)
+      .then((pairRecord) =>
+        window.VacationAPI.update(record.id, { vacationType: editType, dia: trimmedDia }).then(
+          () => pairRecord
+        )
+      )
+      .then((pairRecord) => {
         setList((prev) =>
-          prev.map((v) => (v.id === record.id ? { ...v, vacationType: editType, dia: editDia.trim() } : v))
+          prev.map((v) => (v.id === record.id ? { ...v, vacationType: editType, dia: trimmedDia } : v))
         );
         setEditingId(null);
+        if (!pairRecord) return null;
+        // 원래 야간이라 짝 비번이 있었는데, 수정 후에도 여전히 야간이면 짝도 새 값에 맞게 갱신하고,
+        // 더 이상 야간이 아니게 바뀌었으면(비야간 DIA로 바꿈) 짝 비번은 더 이상 유효하지 않으니 취소해요.
+        const newCompanionType = NIGHT_COMPANION_TYPE_MAP[editType];
+        const stillNight = newCompanionType && isNightShiftCode(trimmedDia, record.branch);
+        if (stillNight) {
+          const newCompanionDia = nightDiaToOffDutyDia(trimmedDia);
+          return window.VacationAPI.update(pairRecord.id, {
+            vacationType: newCompanionType,
+            dia: newCompanionDia,
+          }).then(() => {
+            setList((prev) =>
+              prev.map((v) =>
+                v.id === pairRecord.id
+                  ? { ...v, vacationType: newCompanionType, dia: newCompanionDia }
+                  : v
+              )
+            );
+          });
+        }
+        return window.VacationAPI.cancel(pairRecord.id).then(() => {
+          setList((prev) =>
+            prev.some((v) => v.id === pairRecord.id)
+              ? prev.map((v) => (v.id === pairRecord.id ? { ...v, status: "취소됨" } : v))
+              : prev
+          );
+          alert("수정하신 내용은 더 이상 야간 근무가 아니라서, 다음날 자동 등록됐던 비번은 취소했어요.");
+        });
       })
       .catch((err) => alert("수정 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setEditSaving(false));
@@ -3640,6 +4950,71 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
                 {yearStats.map((s) => `${s.type} ${s.count}`).join(" · ")}
               </div>
             )}
+          </div>
+        )}
+        {!loading && currentUser.branch === "경산" && hyuchungdangList.length > 0 && (
+          <div
+            style={{
+              background: "#fff7e6",
+              border: "1px solid #f5cf7a",
+              borderRadius: "10px",
+              padding: "10px 14px",
+              marginBottom: "16px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: "6px",
+              }}
+            >
+              <div style={{ fontSize: "12px", fontWeight: 700, color: "#e08a20" }}>🔁 신청한 휴충당</div>
+              <div style={{ fontSize: "12px", color: "#888" }}>
+                올해 확정 휴충당 <strong style={{ color: "#e08a20" }}>{hyuchungdangConfirmedCount}건</strong>
+              </div>
+            </div>
+            {hyuchungdangList.map((r) => {
+              const cancelled = r.status === "취소됨";
+              const confirmed = !cancelled && r.confirmedBy && r.substituteDia;
+              return (
+                <div
+                  key={r.id}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    fontSize: "13px",
+                    padding: "3px 0",
+                    opacity: cancelled ? 0.5 : 1,
+                    textDecoration: cancelled ? "line-through" : "none",
+                  }}
+                >
+                  <span>
+                    {r.date} ({weekdayShort(r.date)})
+                    {confirmed ? (
+                      <span style={{ color: "#1caa5c", fontWeight: 700 }}>
+                        {" "}
+                        · {r.originalDia}→{r.substituteDia}충당 확정
+                      </span>
+                    ) : (
+                      r.originalDia && (
+                        <span style={{ color: "#1b3a5c", fontWeight: 700 }}> · {r.originalDia}</span>
+                      )
+                    )}
+                  </span>
+                  {!cancelled && !confirmed && (
+                    <span
+                      style={{ color: "#e02020", textDecoration: "underline", cursor: "pointer", fontSize: "12px" }}
+                      onClick={() => handleCancelMyHyuchungdang(r.id)}
+                    >
+                      취소
+                    </span>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
         <div style={modal.countText}>오늘부터 이후 신청 내역이에요</div>
@@ -3753,10 +5128,21 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
   const [saving, setSaving] = useState(false);
 
   // 본인 교번틀 기준으로 그 날짜의 실제 교번을 계산 (자기 휴가 신청 폼과 동일한 방식)
-  const myEmp = (employees || []).find((e) => e.id === currentUser.id);
+  // 이름+소속 우선, ID는 보조로 찾아요 (본인 신청 폼과 동일한 방식 - 위 주석 참고)
+  const myEmp =
+    (employees || []).find((e) => e.name === currentUser.name && e.branch === currentUser.branch) ||
+    (employees || []).find((e) => e.id === currentUser.id);
   const myBaseCode = myEmp ? myEmp.baseCode : "";
   const myTeamKey = REVERSE_TEAM_MAP[currentUser.branch];
   const myOrder = GYOBUN_ORDER[myTeamKey] || [];
+
+  // DIA 드롭다운용 - 소속 교번틀 코드 목록 (자유입력으로 인한 오타/이상값 방지)
+  const branchEmployeesForDia = (employees || []).filter((e) => e.branch === currentUser.branch);
+  const templateCodesForDia = myOrder.filter((c) => branchEmployeesForDia.some((e) => e.code === c));
+  const otherCodesForDia = [...new Set(branchEmployeesForDia.map((e) => e.code))].filter(
+    (c) => !templateCodesForDia.includes(c)
+  );
+  const branchCodesForDia = [...templateCodesForDia, ...otherCodesForDia];
   const codeForDate = (dateStr) => {
     if (!BASE_DATE || !myBaseCode || !myOrder.length) return "";
     const offset = diffDays_(BASE_DATE, dateStr);
@@ -3978,9 +5364,8 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
                               <option key={t} value={t}>{t}</option>
                             ))}
                           </select>
-                          <input
+                          <select
                             style={{ ...styles.select, flex: "0 0 90px", marginBottom: 0 }}
-                            placeholder="DIA"
                             value={
                               formState[date] && formState[date].dia !== undefined
                                 ? formState[date].dia
@@ -3989,7 +5374,12 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
                             onChange={(e) =>
                               setFormState((prev) => ({ ...prev, [date]: { ...prev[date], dia: e.target.value } }))
                             }
-                          />
+                          >
+                            <option value="">교번 선택</option>
+                            {branchCodesForDia.map((c) => (
+                              <option key={c} value={c}>{c}</option>
+                            ))}
+                          </select>
                           {!st.linkNext && (
                             <button
                               style={{ ...adminStyles.approveBtn, flexShrink: 0 }}
@@ -4036,16 +5426,20 @@ function LotteryApplyPanel({ currentUser, onClose, employees }) {
                                 <option key={t} value={t}>{t}</option>
                               ))}
                             </select>
-                            <input
+                            <select
                               style={{ ...styles.select, flex: "0 0 90px", marginBottom: 0 }}
-                              placeholder="2일차 DIA"
                               value={
                                 st.nextDia !== undefined ? st.nextDia : codeForDate(nextDateInfo.date)
                               }
                               onChange={(e) =>
                                 setFormState((prev) => ({ ...prev, [date]: { ...prev[date], nextDia: e.target.value } }))
                               }
-                            />
+                            >
+                              <option value="">2일차 교번</option>
+                              {branchCodesForDia.map((c) => (
+                                <option key={c} value={c}>{c}</option>
+                              ))}
+                            </select>
                             <button
                               style={{ ...adminStyles.approveBtn, flexShrink: 0, background: "#7a4fd1" }}
                               disabled={saving}
@@ -4232,8 +5626,8 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
       const winnerSetByDate = {};
       for (const dateInfo of event.dates) {
         const date = dateInfo.date;
-        const existing = await window.VacationAPI.getByDate(date);
-        const activeExisting = existing.filter((v) => v.branch === event.branch && v.status !== "취소됨");
+        const existing = await window.VacationAPI.getByDate(date, event.branch);
+        const activeExisting = existing.filter((v) => v.status !== "취소됨");
         const activeCapacityCount = activeExisting.filter((v) => isCapacityType(v.vacationType)).length;
         activeCapacityCountByDate[date] = activeCapacityCount;
         // 명절은 특수 상황이 많아서, 자동 계산 대신 관리자가 그 날짜에 직접 지정한 인원을 그대로 써요
@@ -4538,6 +5932,607 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* 휴충당 신청 현황 (경산 전용, 운용 전용 - 관리자 메뉴와 무관, isMidManager면 누구나) */
+/* 휴가현황 달력과 완전히 분리된 별도 화면이지만, 디자인은 거의 동일하게 맞췄어요.       */
+/* 날짜 칸에 신청 인원수(0 포함)를 배지로 보여주고, 클릭하면 그날 상세(휴가 상세창과      */
+/* 비슷한 디자인)로 신청자 표를 보여주고, "+ 휴충당 지정"으로 대신기록과 같은 형태의      */
+/* 폼(이름+충당교번 선택)으로 신청자 없이도 직접 등록할 수 있어요.                        */
+/* ------------------------------------------------------------------ */
+function HyuchungdangAdminPanel({ branch, onClose, employees, managers, holidaySet }) {
+  const now = new Date();
+  const [viewYear, setViewYear] = useState(now.getFullYear());
+  const [viewMonth, setViewMonth] = useState(now.getMonth()); // 0-indexed
+  const [allRequests, setAllRequests] = useState([]); // 이 소속의 전체 휴충당 신청(모든 상태)
+  const [loading, setLoading] = useState(true);
+  const [selectedDate, setSelectedDate] = useState(null); // 상세 팝업용
+  const [editingConfirmId, setEditingConfirmId] = useState(null); // 확인자 재수정 중인 신청 id
+  const [showAssignForm, setShowAssignForm] = useState(false); // "+ 휴충당 지정" 폼 표시 여부
+  const [assignTargetId, setAssignTargetId] = useState("");
+  const [assignSubstituteDia, setAssignSubstituteDia] = useState("");
+  const [assignSaving, setAssignSaving] = useState(false);
+
+  // 월 달력 스와이프용 (휴가 달력과 동일한 방식)
+  const touchStartX = useRef(null);
+  const gridRef = useRef(null);
+  const [slideX, setSlideX] = useState(0);
+  const [slideTransition, setSlideTransition] = useState(false);
+
+  // 날짜 상세 팝업 스와이프용 (휴가 상세창과 동일한 방식)
+  const dayTouchStartX = useRef(null);
+  const dayGridRef = useRef(null);
+  const [daySlideX, setDaySlideX] = useState(0);
+  const [daySlideTransition, setDaySlideTransition] = useState(false);
+
+  // PC(넓은 화면)인지 감지 - 넓은 화면에서는 상세 팝업 바깥을 클릭해도 안 닫히게 하기 위함
+  const [isWideScreen, setIsWideScreen] = useState(
+    typeof window !== "undefined" && window.innerWidth >= 640
+  );
+  useEffect(() => {
+    const onResize = () => setIsWideScreen(window.innerWidth >= 640);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // 충당교번 드롭다운/지정 대상자 계산용 - 그 소속의 교번틀 코드 목록·직원 목록
+  const teamKey = REVERSE_TEAM_MAP[branch];
+  const order = GYOBUN_ORDER[teamKey] || [];
+  const branchEmployees = (employees || []).filter((e) => e.branch === branch);
+  const templateCodes = order.filter((c) => branchEmployees.some((e) => e.code === c));
+  const otherCodes = [...new Set(branchEmployees.map((e) => e.code))].filter((c) => !templateCodes.includes(c));
+  const branchCodes = [...templateCodes, ...otherCodes];
+
+  // 확인자 드롭다운용 - 그 소속 운용 명단 (이름순)
+  const branchManagerNames = (managers || [])
+    .filter((m) => m.branch === branch)
+    .map((m) => m.name)
+    .sort((a, b) => a.localeCompare(b, "ko"));
+
+  const load = () => {
+    setLoading(true);
+    waitForFirestore()
+      .then(() => window.HyuchungdangAPI.listAllForBranch(branch))
+      .then((data) => {
+        setAllRequests(data || []);
+      })
+      .catch((err) => alert("불러오기 실패: " + (err && err.message ? err.message : err)))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const changeMonth = (delta) => {
+    let y = viewYear;
+    let m = viewMonth + delta;
+    if (m < 0) { m = 11; y -= 1; }
+    if (m > 11) { m = 0; y += 1; }
+    setViewYear(y);
+    setViewMonth(m);
+  };
+
+  const handleTouchStart = (e) => {
+    touchStartX.current = e.touches[0].clientX;
+    setSlideTransition(false);
+  };
+  const handleTouchMove = (e) => {
+    if (touchStartX.current == null) return;
+    setSlideX(e.touches[0].clientX - touchStartX.current);
+  };
+  const handleTouchEnd = () => {
+    if (touchStartX.current == null) return;
+    const dx = slideX;
+    touchStartX.current = null;
+    const width = gridRef.current ? gridRef.current.offsetWidth : 320;
+
+    if (Math.abs(dx) > 60) {
+      const dir = dx < 0 ? 1 : -1;
+      setSlideTransition(true);
+      setSlideX(-dir * width);
+      setTimeout(() => {
+        changeMonth(dir);
+        setSlideTransition(false);
+        setSlideX(dir * width);
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            setSlideTransition(true);
+            setSlideX(0);
+          });
+        });
+      }, 220);
+    } else {
+      setSlideTransition(true);
+      setSlideX(0);
+    }
+  };
+
+  // 상세 팝업 안에서 이전/다음 날짜로 이동 (화살표 버튼 + 스와이프 공용)
+  const changeSelectedDate = (delta) => {
+    if (!selectedDate) return;
+    const d = new Date(selectedDate + "T00:00:00");
+    d.setDate(d.getDate() + delta);
+    const newYear = d.getFullYear();
+    const newMonth = d.getMonth();
+    const newDateStr = `${newYear}-${pad2(newMonth + 1)}-${pad2(d.getDate())}`;
+    if (newYear !== viewYear || newMonth !== viewMonth) {
+      setViewYear(newYear);
+      setViewMonth(newMonth);
+    }
+    setSelectedDate(newDateStr);
+    setShowAssignForm(false);
+    setEditingConfirmId(null);
+  };
+
+  const handleDayTouchStart = (e) => {
+    dayTouchStartX.current = e.touches[0].clientX;
+    setDaySlideTransition(false);
+  };
+  const handleDayTouchMove = (e) => {
+    if (dayTouchStartX.current == null) return;
+    setDaySlideX(e.touches[0].clientX - dayTouchStartX.current);
+  };
+  const handleDayTouchEnd = () => {
+    if (dayTouchStartX.current == null) return;
+    dayTouchStartX.current = null;
+    const dx = daySlideX;
+    const width = dayGridRef.current ? dayGridRef.current.offsetWidth : 320;
+
+    if (Math.abs(dx) > 60) {
+      const dir = dx < 0 ? 1 : -1;
+      setDaySlideTransition(true);
+      setDaySlideX(-dir * width);
+      setTimeout(() => {
+        changeSelectedDate(dir);
+        setDaySlideTransition(false);
+        setDaySlideX(dir * width);
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            setDaySlideTransition(true);
+            setDaySlideX(0);
+          });
+        });
+      }, 220);
+    } else {
+      setDaySlideTransition(true);
+      setDaySlideX(0);
+    }
+  };
+
+  // 신청중인 것만 실제 "달력에 보이는 신청"으로 취급 (취소된 건 집계·목록 어디에도 안 잡힘)
+  const activeRequests = allRequests.filter((r) => r.status === "신청중");
+  const monthMap = {};
+  activeRequests.forEach((r) => {
+    if (!monthMap[r.date]) monthMap[r.date] = [];
+    monthMap[r.date].push(r);
+  });
+
+  // 특정 직원의 특정 날짜 실제 교번 계산 (운용이 직접 지정할 때, 원래 교번을 자동으로 채워주기 위함)
+  const codeForEmployeeOnDate = (empId, dateStr) => {
+    const emp = branchEmployees.find((e) => e.id === empId);
+    if (!emp || !BASE_DATE || !emp.baseCode || !order.length) return "";
+    const offset = diffDays_(BASE_DATE, dateStr);
+    return shiftCodeByDays_(order, emp.baseCode, offset);
+  };
+
+  // 그 직원이 올해 확정(충당교번+확인까지 마침)한 휴충당 총 건수
+  const confirmedCountForEmployee = (empId, dateStr) => {
+    const year = dateStr.slice(0, 4);
+    return allRequests.filter(
+      (r) => r.employeeId === empId && r.date.startsWith(year) && r.status !== "취소됨" && r.confirmedBy
+    ).length;
+  };
+
+  // 목록 안의 특정 신청 건을 부분 수정 (충당교번/확인자) - 로컬 상태도 같이 갱신
+  const patchRequest = (r, patch) => {
+    window.HyuchungdangAPI.update(r.id, patch)
+      .then(() => {
+        setAllRequests((prev) => prev.map((x) => (x.id === r.id ? { ...x, ...patch } : x)));
+      })
+      .catch((err) => alert("수정 실패: " + (err && err.message ? err.message : err)));
+  };
+
+  const handleConfirmSelect = (r, name) => {
+    if (!r.substituteDia) {
+      alert("충당교번을 먼저 선택해주세요");
+      return;
+    }
+    patchRequest(r, { confirmedBy: name, notified: false });
+    setEditingConfirmId(null);
+  };
+
+  // 운용이 "확정 취소" - 신청 자체는 그대로 두고, 충당교번/확인만 다시 빈 상태로 되돌려요.
+  // (막판 사정 변경 대응용. 신청을 취소하는 게 아니라서 기관사 본인 목록엔 아무 변화 없어요 -
+  // 여전히 "신청중"으로 그대로 보여요.)
+  const handleCancelByAdmin = (r) => {
+    if (!confirm(`${r.name}님의 ${r.date} 휴충당 확정을 취소할까요? (신청 자체는 유지돼요)`)) return;
+    patchRequest(r, { substituteDia: "", confirmedBy: "" });
+  };
+
+  // "+ 휴충당 지정"으로 운용이 직접 등록한 건 - 사람을 잘못 골랐거나 할 때 완전히 지울 수 있어요.
+  // (신청자 본인이 낸 건 아니라서 흔적을 남길 필요 없이 그냥 삭제해요)
+  const handleRemoveAssigned = (r) => {
+    if (!confirm(`${r.name}님으로 지정한 ${r.date} 휴충당을 완전히 삭제할까요?`)) return;
+    window.HyuchungdangAPI.remove(r.id)
+      .then(() => {
+        setAllRequests((prev) => prev.filter((x) => x.id !== r.id));
+      })
+      .catch((err) => alert("삭제 실패: " + (err && err.message ? err.message : err)));
+  };
+
+  const openAssignForm = () => {
+    setAssignTargetId("");
+    setAssignSubstituteDia("");
+    setShowAssignForm(true);
+  };
+
+  const handleAssign = () => {
+    const emp = branchEmployees.find((e) => e.id === assignTargetId);
+    if (!emp) {
+      alert("대상자를 선택해주세요");
+      return;
+    }
+    if (activeRequests.some((r) => r.employeeId === emp.id && r.date === selectedDate)) {
+      alert("이미 그 날짜에 신청(또는 지정)된 기록이 있어요");
+      return;
+    }
+    setAssignSaving(true);
+    const id = `${emp.id}_${selectedDate}`;
+    const originalDia = codeForEmployeeOnDate(emp.id, selectedDate);
+    window.HyuchungdangAPI.request(id, {
+      employeeId: emp.id,
+      name: emp.name,
+      branch,
+      date: selectedDate,
+      originalDia,
+      assignedByAdmin: true,
+      ...(assignSubstituteDia ? { substituteDia: assignSubstituteDia } : {}),
+    })
+      .then(() => {
+        setAllRequests((prev) => [
+          ...prev,
+          {
+            id,
+            employeeId: emp.id,
+            name: emp.name,
+            branch,
+            date: selectedDate,
+            originalDia,
+            substituteDia: assignSubstituteDia || undefined,
+            assignedByAdmin: true,
+            status: "신청중",
+          },
+        ]);
+        setShowAssignForm(false);
+        setAssignTargetId("");
+        setAssignSubstituteDia("");
+      })
+      .catch((err) => alert("지정 실패: " + (err && err.message ? err.message : err)))
+      .finally(() => setAssignSaving(false));
+  };
+
+  const closeDetail = () => {
+    setSelectedDate(null);
+    setShowAssignForm(false);
+    setEditingConfirmId(null);
+  };
+
+  const firstWeekday = new Date(viewYear, viewMonth, 1).getDay();
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const cells = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  const todayKey = todayStr();
+  const selectedRows = selectedDate ? monthMap[selectedDate] || [] : [];
+
+  return (
+    <div style={modal.overlay} onClick={onClose}>
+      <div
+        style={{ background: "#f7f4ee", width: "100%", maxWidth: "480px", margin: "0 auto", minHeight: "100vh" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={cal.header}>
+          <div style={cal.headerTop}>
+            <div style={cal.userName}>🔁 휴충당 신청 현황</div>
+            <div style={cal.headerBtnRow}>
+              <button style={adminStyles.adminBtn} onClick={onClose}>닫기</button>
+            </div>
+          </div>
+          <div style={cal.navRow}>
+            <button style={cal.navBtn} onClick={() => changeMonth(-1)}>‹</button>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
+              <div style={cal.monthTitle}>{viewYear}년 {viewMonth + 1}월</div>
+              {(viewYear !== now.getFullYear() || viewMonth !== now.getMonth()) && (
+                <button
+                  style={{
+                    border: "1px solid rgba(255,255,255,0.4)",
+                    background: "transparent",
+                    color: "#cfe0ff",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    padding: "2px 8px",
+                    borderRadius: "6px",
+                  }}
+                  onClick={() => {
+                    setViewYear(now.getFullYear());
+                    setViewMonth(now.getMonth());
+                  }}
+                >
+                  오늘로
+                </button>
+              )}
+            </div>
+            <button style={cal.navBtn} onClick={() => changeMonth(1)}>›</button>
+          </div>
+          <div style={cal.weekRow}>
+            {WEEKDAYS.map((w, i) => (
+              <div key={w} style={{ color: i === 0 ? "#ff8a80" : i === 6 ? "#8ecdff" : "#c9d4de" }}>
+                {w}
+              </div>
+            ))}
+          </div>
+          <div style={cal.railDivider} />
+        </div>
+
+        {loading ? (
+          <div style={{ textAlign: "center", color: "#aaa", padding: "24px" }}>불러오는 중...</div>
+        ) : (
+          <div
+            style={{ overflow: "hidden", width: "100%" }}
+            onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
+            onTouchEnd={handleTouchEnd}
+          >
+            <div
+              ref={gridRef}
+              style={{
+                ...cal.grid,
+                transform: `translateX(${slideX}px)`,
+                transition: slideTransition ? "transform 220ms ease" : "none",
+              }}
+            >
+              {cells.map((d, i) => {
+                if (d === null) return <div key={i} style={cal.emptyCell} />;
+                const key = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(d)}`;
+                const dayRequests = monthMap[key] || [];
+                const confirmedList = dayRequests.filter((r) => r.confirmedBy);
+                const pendingList = dayRequests.filter((r) => !r.confirmedBy);
+                const isConfirmedState = key < todayKey || confirmedList.length > 0;
+                const displayCount = isConfirmedState ? confirmedList.length : pendingList.length;
+                const badgeColor = isConfirmedState ? "#1caa5c" : displayCount > 0 ? "#e08a20" : "#ccc";
+                const dayType = getDayType(key, holidaySet);
+                return (
+                  <div key={i} style={cal.dayCell(key === todayKey)} onClick={() => setSelectedDate(key)}>
+                    <div style={cal.dayNum(dayType)}>{d}</div>
+                    <div style={cal.dayDivider} />
+                    <div style={{ fontSize: "11px", color: "#aaa" }}>{isConfirmedState ? "확정" : "신청"}</div>
+                    <div style={cal.dayBadge(badgeColor)}>{displayCount}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {selectedDate && (() => {
+        const headerColor = dateHeaderColor(selectedDate, holidaySet);
+        return (
+          <div
+            style={{ ...modal.overlay, alignItems: "safe center", justifyContent: "center", zIndex: 200 }}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!isWideScreen) closeDetail();
+            }}
+          >
+            <div style={{ ...modal.sheet, maxWidth: "480px" }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "4px" }}>
+                <button style={{ ...adminStyles.adminBtn, padding: "6px 10px", fontSize: "14px" }} onClick={() => changeSelectedDate(-1)}>
+                  ‹
+                </button>
+                <div style={{ ...modal.dateTitle, marginBottom: 0, color: headerColor }}>
+                  {formatDateHeader(selectedDate)}
+                </div>
+                <button style={{ ...adminStyles.adminBtn, padding: "6px 10px", fontSize: "14px" }} onClick={() => changeSelectedDate(1)}>
+                  ›
+                </button>
+              </div>
+              <div
+                style={{ overflowX: "hidden" }}
+                onTouchStart={handleDayTouchStart}
+                onTouchMove={handleDayTouchMove}
+                onTouchEnd={handleDayTouchEnd}
+              >
+              <div
+                ref={dayGridRef}
+                style={{
+                  transform: `translateX(${daySlideX}px)`,
+                  transition: daySlideTransition ? "transform 220ms ease" : "none",
+                }}
+              >
+              <div style={modal.countText}>신청중 {selectedRows.length}명</div>
+
+              {selectedRows.length === 0 ? (
+                <div style={{ textAlign: "center", color: "#aaa", padding: "16px 0" }}>신청자가 없어요</div>
+              ) : (
+                <div style={{ overflowX: "auto", marginBottom: "12px" }}>
+                  <table style={{ width: "max-content", minWidth: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+                    <thead>
+                      <tr style={{ borderBottom: "2px solid #333" }}>
+                        <th style={tbl.th}>#</th>
+                        <th style={{ ...tbl.th, textAlign: "left" }}>이름</th>
+                        <th style={tbl.th}>교번</th>
+                        <th style={tbl.th}>충당교번</th>
+                        <th style={tbl.th}>확인</th>
+                        <th style={tbl.th}>올해 확정</th>
+                        <th style={tbl.th}></th>
+                        <th style={tbl.th}></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selectedRows.map((r, idx) => (
+                        <tr key={r.id} style={{ borderBottom: "1px solid #eee" }}>
+                          <td style={tbl.td}>{idx + 1}</td>
+                          <td style={{ ...tbl.td, textAlign: "left", fontWeight: 700 }}>{r.name}</td>
+                          <td style={{ ...tbl.td, fontWeight: 700, color: "#1b3a5c" }}>{r.originalDia || "-"}</td>
+                          <td style={tbl.td}>
+                            <select
+                              value={r.substituteDia || ""}
+                              onChange={(e) => patchRequest(r, { substituteDia: e.target.value })}
+                              style={{ fontSize: "12px", padding: "2px", maxWidth: "76px" }}
+                            >
+                              <option value="">선택</option>
+                              {branchCodes.map((c) => (
+                                <option key={c} value={c}>{c}</option>
+                              ))}
+                            </select>
+                          </td>
+                          <td style={tbl.td}>
+                            {r.confirmedBy ? (
+                              editingConfirmId === r.id ? (
+                                <select
+                                  value={r.confirmedBy}
+                                  onChange={(e) => {
+                                    if (e.target.value) handleConfirmSelect(r, e.target.value);
+                                  }}
+                                  onBlur={() => setEditingConfirmId(null)}
+                                  style={{ fontSize: "11px", padding: "2px", maxWidth: "80px" }}
+                                  autoFocus
+                                >
+                                  {branchManagerNames.map((name) => (
+                                    <option key={name} value={name}>{name}</option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <span
+                                  style={{ color: "#1caa5c", cursor: "pointer" }}
+                                  onClick={() => setEditingConfirmId(r.id)}
+                                >
+                                  ✅{r.confirmedBy} ✏️
+                                </span>
+                              )
+                            ) : (
+                              <select
+                                value=""
+                                onChange={(e) => {
+                                  if (e.target.value) handleConfirmSelect(r, e.target.value);
+                                }}
+                                style={{ fontSize: "11px", padding: "2px", maxWidth: "80px" }}
+                              >
+                                <option value="">확인</option>
+                                {branchManagerNames.map((name) => (
+                                  <option key={name} value={name}>{name}</option>
+                                ))}
+                              </select>
+                            )}
+                          </td>
+                          <td style={tbl.td}>{confirmedCountForEmployee(r.employeeId, r.date)}건</td>
+                          <td style={tbl.td}>
+                            {r.confirmedBy && (
+                              <span
+                                style={{ color: "#e02020", textDecoration: "underline", cursor: "pointer", fontSize: "12px" }}
+                                onClick={() => handleCancelByAdmin(r)}
+                              >
+                                확정취소
+                              </span>
+                            )}
+                          </td>
+                          <td style={tbl.td}>
+                            {r.assignedByAdmin && (
+                              <span
+                                style={{ color: "#999", textDecoration: "underline", cursor: "pointer", fontSize: "12px" }}
+                                onClick={() => handleRemoveAssigned(r)}
+                              >
+                                삭제
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {!showAssignForm ? (
+                <button style={{ ...modal.addBtn, background: "#e08a20" }} onClick={openAssignForm}>
+                  + 휴충당 지정
+                </button>
+              ) : (
+                <React.Fragment>
+                  <div style={{ ...modal.dateTitle, fontSize: "16px", marginTop: "10px" }}>
+                    {formatDateHeader(selectedDate)} 휴충당 지정
+                  </div>
+                  <div style={{ ...modal.countText, marginBottom: "18px" }}>운용이 직접 지정하는 기록이에요</div>
+
+                  <div style={modal.formRow}>
+                    <label style={modal.label}>대상자</label>
+                    <select
+                      style={modal.input}
+                      value={assignTargetId}
+                      onChange={(e) => setAssignTargetId(e.target.value)}
+                    >
+                      <option value="">이름 선택</option>
+                      {[...branchEmployees]
+                        .map((e) => ({ ...e, restCode: codeForEmployeeOnDate(e.id, selectedDate) }))
+                        .filter((e) => String(e.restCode || "").startsWith("휴"))
+                        .sort((a, b) => {
+                          const na = parseInt(String(a.restCode).replace(/[^0-9]/g, ""), 10) || 0;
+                          const nb = parseInt(String(b.restCode).replace(/[^0-9]/g, ""), 10) || 0;
+                          return na - nb;
+                        })
+                        .map((e) => (
+                          <option key={e.id} value={e.id}>{e.name} ({e.restCode})</option>
+                        ))}
+                    </select>
+                    <div style={{ fontSize: "12px", color: "#888", marginTop: "4px" }}>
+                      그날 교번이 "휴"인 사람만 목록에 나와요
+                    </div>
+                  </div>
+
+                  <div style={modal.formRow}>
+                    <label style={modal.label}>충당교번</label>
+                    <select
+                      style={modal.input}
+                      value={assignSubstituteDia}
+                      onChange={(e) => setAssignSubstituteDia(e.target.value)}
+                    >
+                      <option value="">교번을 선택해주세요</option>
+                      {branchCodes.map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <button style={modal.addBtn} onClick={handleAssign} disabled={assignSaving}>
+                    {assignSaving ? "저장 중..." : "저장"}
+                  </button>
+                  <button
+                    style={modal.closeBtn}
+                    onClick={() => {
+                      setShowAssignForm(false);
+                      setAssignTargetId("");
+                      setAssignSubstituteDia("");
+                    }}
+                  >
+                    취소
+                  </button>
+                </React.Fragment>
+              )}
+              </div>
+              </div>
+
+              <div style={{ fontSize: "12px", color: "#888", margin: "10px 0" }}>
+                신청자가 없어도, 운용이 기관사와 협의 후 직접 지정할 수 있어요.
+              </div>
+              <button style={modal.closeBtn} onClick={closeDetail}>닫기</button>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
 function AdminPanel({ branch, isSuperAdmin, onClose, employees, managers }) {
   const [tab, setTab] = useState("pending"); // "pending" | "approved"
   const [viewBranch, setViewBranch] = useState(branch); // 전체관리자만 전환 가능, 그 외엔 항상 본인 소속
@@ -4570,31 +6565,13 @@ function AdminPanel({ branch, isSuperAdmin, onClose, employees, managers }) {
   const handleResetDevice = (p) => {
     if (
       !confirm(
-        `${p.name} (${p.branch})님의 기기변경을 허용할까요?\n기존 등록 정보가 초기화되고, 새 기기에서 다시 등록 후 재승인을 받아야 해요.`
+        `${p.name} (${p.branch})님의 승인 기록을 삭제할까요?\n삭제 후 다시 등록하면 재승인을 받아야 해요.`
       )
     )
       return;
     window.ApprovalAPI.reset(p.id).then(() => {
       setApproved((prev) => prev.filter((a) => a.id !== p.id));
     });
-  };
-
-  // 인사이동/퇴사로 현재 직원목록에 없는 사람 - 접근 차단 + 그동안의 휴가 기록까지 완전 삭제 (되돌릴 수 없음)
-  const handleRemoveDeparted = (p) => {
-    if (
-      !confirm(
-        `${p.name} (${p.branch})님은 현재 직원목록에 없어요.\n\n` +
-          `접근을 차단하고, 이 사람이 신청했던 휴가 기록도 전부 삭제할까요?\n` +
-          `※ 되돌릴 수 없어요. 단순 기기변경이 필요한 거라면 이 버튼 대신 "기기변경"을 사용해주세요.`
-      )
-    )
-      return;
-    Promise.all([window.ApprovalAPI.reset(p.id), window.VacationAPI.removeAllForEmployee(p.id)])
-      .then(([, deletedCount]) => {
-        alert(`${p.name}님의 접근을 차단하고, 휴가 기록 ${deletedCount}건을 삭제했어요.`);
-        setApproved((prev) => prev.filter((a) => a.id !== p.id));
-      })
-      .catch((err) => alert("처리 실패: " + (err && err.message ? err.message : err)));
   };
 
   const handleDeleteAll = () => {
@@ -4684,15 +6661,12 @@ function AdminPanel({ branch, isSuperAdmin, onClose, employees, managers }) {
         {!loading && tab === "approved" && (
           <React.Fragment>
             <div style={{ ...modal.countText, marginBottom: "10px" }}>
-              폰을 바꾼 사람은 "기기변경", 인사이동·퇴사로 명단에 없는 사람은 아래 표시와 함께 삭제할 수 있어요
+              폰을 바꾼 사람이나, 다시 등록시켜야 하는 사람은 "기록삭제"를 눌러주세요
             </div>
             {approved.length === 0 && (
               <div style={{ textAlign: "center", color: "#aaa", padding: "20px 0" }}>승인된 사용자가 없어요</div>
             )}
             {approved.map((p) => {
-              const stillInRoster =
-                (employees || []).some((e) => e.id === p.id) ||
-                (managers || []).some((m) => m.name === p.name && m.branch === p.branch);
               return (
                 <div key={p.id} style={{ ...modal.card, flexDirection: "column", alignItems: "stretch" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -4700,27 +6674,8 @@ function AdminPanel({ branch, isSuperAdmin, onClose, employees, managers }) {
                       <div style={modal.name}>{p.name}</div>
                       <div style={modal.typeRow}>{p.branch} · {p.id}</div>
                     </div>
-                    <button style={adminStyles.resetBtn} onClick={() => handleResetDevice(p)}>기기변경</button>
+                    <button style={adminStyles.resetBtn} onClick={() => handleResetDevice(p)}>기록삭제</button>
                   </div>
-                  {!stillInRoster && (
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        marginTop: "8px",
-                        paddingTop: "8px",
-                        borderTop: "1px dashed #e6e0d0",
-                      }}
-                    >
-                      <div style={{ fontSize: "12px", color: "#e02020", fontWeight: 700 }}>
-                        ⚠️ 현재 명단에 없음 (인사이동/퇴사 추정)
-                      </div>
-                      <button style={adminStyles.rejectBtn} onClick={() => handleRemoveDeparted(p)}>
-                        접근 차단+기록 삭제
-                      </button>
-                    </div>
-                  )}
                 </div>
               );
             })}
@@ -4746,7 +6701,14 @@ function ManagerAdminPanel({ branch, isSuperAdmin, onClose }) {
   const load = () => {
     setLoading(true);
     waitForFirestore()
-      .then(() => window.ManagerAPI.list())
+      .then(() =>
+        loadCachedList(
+          MANAGER_CACHE_KEY,
+          MANAGER_CACHE_TTL_MS,
+          () => window.ManagerAPI.list(),
+          true // 관리 화면이라 항상 최신 데이터로 새로 불러오고, 그 결과로 캐시도 갱신해요
+        )
+      )
       .then((data) => setList(data.filter((m) => m.branch === viewBranch)))
       .catch((err) => alert("불러오기 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setLoading(false));
@@ -4779,7 +6741,10 @@ function ManagerAdminPanel({ branch, isSuperAdmin, onClose }) {
   const handleRemove = (m) => {
     if (!confirm(`${m.name} (${m.branch})님을 운용 명단에서 삭제할까요?`)) return;
     window.ManagerAPI.remove(m.id)
-      .then(() => setList((prev) => prev.filter((x) => x.id !== m.id)))
+      .then(() => {
+        setList((prev) => prev.filter((x) => x.id !== m.id));
+        invalidateCachedList(MANAGER_CACHE_KEY);
+      })
       .catch((err) => alert("삭제 실패: " + (err && err.message ? err.message : err)));
   };
 
@@ -4844,6 +6809,187 @@ function ManagerAdminPanel({ branch, isSuperAdmin, onClose }) {
 /* 교번앱이 쓰는 검증된 VACATION_API_URL로 경산 휴가 데이터를 가져와        */
 /* 확인·집계 후 실제로 저장까지 할 수 있어요                              */
 /* ------------------------------------------------------------------ */
+
+// 스프레드시트 "신청일" 값을 {year, month, day}로 변환. 두 가지 형식이 섞여 있어요:
+// 1) "10.1", "12.22" 같은 직접입력(월.일, 또는 월/일) - 휴가일(vacationDateStr) 기준으로 연도를 추정해요
+//    (신청월이 휴가월보다 크면 전년도로 - 예: 신청 "12.1", 휴가 "2026-01-01" → 2025년 12월 1일)
+// 2) "2025-12-04T15:00:00.000Z" 같은 ISO 시각(시트 날짜셀이 자동변환된 것) - UTC라 KST로 9시간 보정해요
+function parseReqDateToYMD(reqDateRaw, vacationDateStr) {
+  if (!reqDateRaw) return null;
+  const raw = String(reqDateRaw).trim();
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})T/);
+  if (isoMatch) {
+    const utcDate = new Date(raw);
+    if (isNaN(utcDate.getTime())) return null;
+    const kst = new Date(utcDate.getTime() + 9 * 60 * 60000);
+    return { year: kst.getUTCFullYear(), month: kst.getUTCMonth() + 1, day: kst.getUTCDate() };
+  }
+
+  const dotMatch = raw.match(/^(\d{1,2})[./](\d{1,2})$/);
+  if (dotMatch) {
+    const month = parseInt(dotMatch[1], 10);
+    const day = parseInt(dotMatch[2], 10);
+    if (!month || !day) return null;
+    const vacYear = parseInt(vacationDateStr.slice(0, 4), 10);
+    const vacMonth = parseInt(vacationDateStr.slice(5, 7), 10);
+    const year = month > vacMonth ? vacYear - 1 : vacYear;
+    return { year, month, day };
+  }
+
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* 데이터 초기화 패널 - TEST_MODE 종료 후에도 계속 남아있어요.               */
+/* 휴충당 전체 초기화(경산) / 문양 전체 초기화, 이 두 가지만 여기 있어요.      */
+/* 아직 두 소속 다 테스트 중이라 필요할 때까지 남겨두는 용도예요 - 나중에     */
+/* 필요 없어지면 요청 시 이 패널 자체를 없애면 돼요.                        */
+/* ------------------------------------------------------------------ */
+function DataResetPanel({ onClose, branch, isSuperAdmin }) {
+  const [working, setWorking] = useState(false);
+
+  const handleResetHyuchungdang = () => {
+    if (
+      !confirm(
+        "⚠️ 휴충당 신청/지정 기록을 전부 삭제할까요?\n\n" +
+          "지금까지 신청·확정된 휴충당 기록이 전부 사라져요 (되돌릴 수 없어요). 휴가 기록은 안 건드려요."
+      )
+    )
+      return;
+    if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
+    setWorking(true);
+    Promise.resolve()
+      .then(() => {
+        if (!window.HyuchungdangAPI || typeof window.HyuchungdangAPI.removeAllForBranch !== "function") {
+          throw new Error(
+            "index.html에 HyuchungdangAPI.removeAllForBranch 함수가 아직 없어요. index.html을 먼저 업데이트해주세요."
+          );
+        }
+        return window.HyuchungdangAPI.removeAllForBranch("경산");
+      })
+      .then((count) => {
+        alert(`휴충당 기록 ${count}건을 전부 삭제했어요.`);
+      })
+      .catch((err) => alert("삭제 중 오류: " + (err && err.message ? err.message : err)))
+      .finally(() => setWorking(false));
+  };
+
+  const handleResetMunyang = () => {
+    if (
+      !confirm(
+        "⚠️ 문양 소속의 휴가 기록을 전부 삭제할까요?\n\n" +
+          "문양 데이터가 전부 사라져요 (되돌릴 수 없어요). 경산 데이터는 전혀 안 건드려요."
+      )
+    )
+      return;
+    if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
+    setWorking(true);
+    Promise.resolve()
+      .then(() => window.VacationAPI.removeAllForBranch("문양"))
+      .then((count) => {
+        alert(`문양 휴가 기록 ${count}건을 전부 삭제했어요.`);
+      })
+      .catch((err) => alert("삭제 중 오류: " + (err && err.message ? err.message : err)))
+      .finally(() => setWorking(false));
+  };
+
+  // 2단계: 기존 vacations 컬렉션 → 신규 vacation_days 구조로 복사 (원본은 그대로 두고 옮기기만 해요)
+  // 여러 번 실행해도 안전해요 - 매번 원본 기준으로 다시 계산해서 덮어쓰니, 중간에 실패해도
+  // 다시 누르면 이어서/처음부터 다시 하면 돼요.
+  const [migrating, setMigrating] = useState(false);
+  const [migrateResult, setMigrateResult] = useState(null);
+
+  const handleMigrateToDayDocs = () => {
+    if (!window.VacationDayAPI) {
+      alert("index.html에 VacationDayAPI가 아직 없어요. index.html을 먼저 업데이트해주세요.");
+      return;
+    }
+    if (
+      !confirm(
+        `[${branch}] 기존 휴가 기록을 새 구조(vacation_days)로 복사할까요?\n\n` +
+          "원본(vacations 컬렉션)은 전혀 안 건드리고, 그대로 복사만 해요. 여러 번 눌러도 안전해요."
+      )
+    )
+      return;
+    setMigrating(true);
+    setMigrateResult(null);
+    window.VacationAPI.getAll(branch)
+      .then((allRecords) => {
+        // 날짜별로 묶어요
+        const byDate = {};
+        (allRecords || []).forEach((r) => {
+          if (!r.date) return;
+          if (!byDate[r.date]) byDate[r.date] = {};
+          const { id, ...rest } = r;
+          byDate[r.date][id] = rest;
+        });
+        if (!window.VacationDayAPI.bulkSetDays) {
+          throw new Error("index.html에 VacationDayAPI.bulkSetDays가 아직 없어요. index.html을 먼저 업데이트해주세요.");
+        }
+        return window.VacationDayAPI.bulkSetDays(branch, byDate).then((count) => ({
+          dayCount: Object.keys(byDate).length,
+          recordCount: count,
+        }));
+      })
+      .then(({ dayCount, recordCount }) => {
+        setMigrateResult({ dayCount, recordCount });
+        alert(`완료! ${dayCount}일치, 총 ${recordCount}건을 새 구조로 복사했어요.`);
+      })
+      .catch((err) => {
+        console.error(err);
+        alert("마이그레이션 중 오류: " + (err && err.message ? err.message : err));
+      })
+      .finally(() => setMigrating(false));
+  };
+
+  return (
+    <div style={modal.overlay} onClick={onClose}>
+      <div style={{ ...modal.sheet, maxWidth: "340px" }} onClick={(e) => e.stopPropagation()}>
+        <div style={modal.dateTitle}>🗑️ 데이터 초기화</div>
+        <div style={{ ...modal.countText, marginBottom: "16px" }}>
+          아직 테스트 중인 두 가지만 모아뒀어요. 필요 없어지면 요청 주시면 없애드려요.
+        </div>
+
+        <button
+          style={{ ...styles.button, border: "1px dashed #e08a20", color: "#e08a20", padding: "10px", marginBottom: "10px" }}
+          disabled={working}
+          onClick={handleResetHyuchungdang}
+        >
+          🔁 휴충당 전체 초기화 (경산 - 신청/지정 기록 삭제)
+        </button>
+
+        <button
+          style={{ ...styles.button, border: "1px dashed #e02020", color: "#e02020", padding: "10px", marginBottom: "14px" }}
+          disabled={working}
+          onClick={handleResetMunyang}
+        >
+          🗑️ 문양 전체 초기화 (모든 휴가 기록 삭제)
+        </button>
+
+        {isSuperAdmin && (
+          <>
+            <button
+              style={{ ...styles.button, border: "1px dashed #1a73e8", color: "#1a73e8", padding: "10px", marginBottom: "4px" }}
+              disabled={migrating}
+              onClick={handleMigrateToDayDocs}
+            >
+              {migrating ? "복사 중..." : `🔀 [${branch}] 신규 구조(vacation_days)로 복사`}
+            </button>
+            {migrateResult && (
+              <div style={{ ...modal.countText, marginBottom: "10px", color: "#1a73e8" }}>
+                최근 결과: {migrateResult.dayCount}일치 · {migrateResult.recordCount}건
+              </div>
+            )}
+          </>
+        )}
+
+        <button style={modal.closeBtn} onClick={onClose}>닫기</button>
+      </div>
+    </div>
+  );
+}
+
 function ImportTestPanel({ onClose, employees, managers }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -4857,26 +7003,53 @@ function ImportTestPanel({ onClose, employees, managers }) {
     setLoading(true);
     setError("");
 
-    // 교번앱이 이미 안정적으로 쓰고 있는 검증된 API - 날짜가 이미 완성된 형태("YYYY-MM-DD")로 와서
-    // 지난번 같은 날짜 조합 버그가 원천적으로 없어요. 확인란 데이터는 없고, 그건 운용이 앱에서 직접 확인해요.
-    jsonpRequest(VACATION_API_URL, {})
-      .then((json) => {
-        if (!json || !json.ok || !Array.isArray(json.vacations)) {
-          throw new Error((json && json.error) || "응답 형식이 예상과 달라요");
+    // 실제 배포된 API 응답 형식(재배포 후 확인됨): { entries: { "YYYY-MM-DD": [...] }, holidays: {...} }
+    // 각 항목엔 row/name/type/dia/confirmer/cancelled/note/reqDate/seq가 들어있어요.
+    // 이 스크립트의 doGet은 JSONP 콜백을 감싸주지 않고 순수 JSON만 반환해서, jsonpRequest 대신
+    // 일반 fetch로 받아요. 실패하면 실제로 뭐가 왔는지 에러 메시지에 같이 남겨서 바로 원인을 알 수 있게 해요.
+    // 캐시버스팅용 쿼리(_=시각) + no-store로, 서비스워커/브라우저/구글 쪽 캐시에 걸려서 옛날 응답이
+    // 재사용되는 걸 확실히 막아요 (같은 URL을 반복 호출하면 캐시된 옛 응답이 나올 수 있어서).
+    fetch(`${VACATION_API_URL}?_=${Date.now()}`, { cache: "no-store" })
+      .then((res) => {
+        if (!res.ok) throw new Error(`서버 응답 오류 (${res.status})`);
+        return res.text();
+      })
+      .then((text) => {
+        console.log("VACATION_API_URL 원본 응답:", text.slice(0, 500));
+        let json;
+        try {
+          json = JSON.parse(text);
+        } catch (parseErr) {
+          throw new Error(
+            "JSON 파싱 실패 (응답이 JSON이 아니에요) - 응답 앞부분: " + text.slice(0, 150)
+          );
         }
-        const flat = json.vacations
-          .filter((v) => v && v.date && v.name)
+        if (!json || !json.entries) {
+          const keyInfo = json ? `실제로 받은 키: [${Object.keys(json).join(", ")}]` : "응답이 비어있어요";
+          throw new Error((json && json.error) || `응답 형식이 예상과 달라요 - ${keyInfo}`);
+        }
+        const flat = [];
+        Object.keys(json.entries).forEach((dateStr) => {
+          (json.entries[dateStr] || []).forEach((item) => {
+            if (!item || !item.name) return;
+            flat.push({
+              date: dateStr,
+              name: String(item.name).trim(),
+              type: item.type ? String(item.type).trim() : "",
+              // 스프레드시트 셀이 "숫자" 형식이면 dia가 숫자로 넘어와서, 문자열 메서드를 쓰는
+              // 다른 코드에서 예상 못한 오류가 날 수 있어요. 여기서 무조건 문자열로 통일해요.
+              dia: item.dia == null ? "" : String(item.dia).trim(),
+              cancelled: !!item.cancelled,
+              confirmer: item.confirmer || null,
+              reqDate: item.reqDate || null, // "M.d" 또는 ISO 시각 - parseReqDateToYMD로 해석
+              seq: item.seq == null || item.seq === "" ? null : item.seq,
+            });
+          });
+        });
+        const filtered = flat
           .filter((v) => v.date >= IMPORT_FROM_DATE) // 이 날짜 이전 데이터는 제외
-          .map((v) => ({
-            date: v.date,
-            name: String(v.name).trim(),
-            type: v.type ? String(v.type).trim() : "",
-            dia: v.dia == null ? "" : v.dia,
-            cancelled: !!v.cancelled,
-            seq: v.seq || 0,
-          }));
-        flat.sort((a, b) => a.date.localeCompare(b.date));
-        setRows(flat);
+          .sort((a, b) => a.date.localeCompare(b.date));
+        setRows(filtered);
       })
       .catch((err) => {
         console.error(err);
@@ -4942,6 +7115,21 @@ function ImportTestPanel({ onClose, employees, managers }) {
     .map((r) => {
       const matchedId = matchEmployeeId(r.name);
       const autoConfirmed = r.date <= cutoffDate;
+      let createdAt = null;
+      let createdAtDateOnly = false;
+      const parsed = parseReqDateToYMD(r.reqDate, r.date);
+      if (parsed && window.VacationAPI && typeof window.VacationAPI.timestampFromDate === "function") {
+        try {
+          const ts = window.VacationAPI.timestampFromDate(parsed.year, parsed.month, parsed.day);
+          // timestampFromDate가 실수로 async(Promise 반환)로 정의돼 있으면 여기서 걸러내요
+          if (ts && typeof ts.then !== "function") {
+            createdAt = ts;
+            createdAtDateOnly = true;
+          }
+        } catch (err) {
+          console.error("신청일 변환 실패:", err);
+        }
+      }
       return {
         date: r.date,
         name: r.name,
@@ -4951,8 +7139,10 @@ function ImportTestPanel({ onClose, employees, managers }) {
         vacationType: r.type,
         dia: r.dia,
         status: r.cancelled ? "취소됨" : "정상",
-        confirmedBy: autoConfirmed ? "확인" : null,
+        confirmedBy: r.confirmer || (autoConfirmed ? "확인" : null),
         priority: isCapacityType(r.type) ? r.seq || 0 : null, // 일단 원본 순번(임시), 아래에서 날짜별로 다시 매김
+        createdAt,
+        createdAtDateOnly,
       };
     });
   // 제외된 사람 때문에 순번에 구멍이 생기지 않도록, 날짜별로 보장휴가 순번을 1번부터 다시 매겨요
@@ -4982,36 +7172,39 @@ function ImportTestPanel({ onClose, employees, managers }) {
 
     setImporting(true);
     setImportResult(null);
-    const newIds = [];
-    let successCount = 0;
-    let failCount = 0;
 
-    const importOne = (c) =>
-      window.VacationAPI.add({
-        name: c.name,
-        branch: c.branch,
-        employeeId: c.employeeId,
-        vacationType: c.vacationType,
-        dia: c.dia,
-        date: c.date,
-        ...(c.priority != null ? { priority: c.priority } : {}),
-      })
-        .then((id) => {
-          newIds.push(id);
-          successCount += 1;
-          if (c.status === "취소됨") return window.VacationAPI.cancel(id);
-          if (c.confirmedBy) return window.VacationAPI.confirm(id, c.confirmedBy);
-        })
-        .catch((err) => {
-          console.error(err);
-          failCount += 1;
-        });
+    // 한 건씩 저장하면 실시간 리스너가 매번 다시 그려지면서 (특히 건수가 많을 때) 화면이
+    // 버벅이거나 멈출 수 있어서, 여러 건을 묶어서 한 번에 저장하는 방식으로 처리해요.
+    const payload = converted.map((c) => ({
+      name: c.name,
+      branch: c.branch,
+      employeeId: c.employeeId,
+      vacationType: c.vacationType,
+      dia: c.dia,
+      date: c.date,
+      status: c.status,
+      ...(c.priority != null ? { priority: c.priority } : {}),
+      ...(c.confirmedBy ? { confirmedBy: c.confirmedBy } : {}),
+      ...(c.createdAt ? { createdAt: c.createdAt, createdAtDateOnly: true } : {}),
+    }));
 
-    converted
-      .reduce((chain, c) => chain.then(() => importOne(c)), Promise.resolve())
+    Promise.resolve()
       .then(() => {
-        setImportedIds((prev) => [...prev, ...newIds]);
-        setImportResult({ success: successCount, fail: failCount });
+        if (!window.VacationAPI || typeof window.VacationAPI.bulkImport !== "function") {
+          throw new Error(
+            "index.html에 VacationAPI.bulkImport 함수가 아직 없어요. index.html을 먼저 업데이트해주세요."
+          );
+        }
+        return window.VacationAPI.bulkImport(payload);
+      })
+      .then((ids) => {
+        setImportedIds((prev) => [...prev, ...ids]);
+        setImportResult({ success: ids.length, fail: converted.length - ids.length });
+      })
+      .catch((err) => {
+        console.error(err);
+        alert("저장 실패: " + (err && err.message ? err.message : err));
+        setImportResult({ success: 0, fail: converted.length });
       })
       .finally(() => setImporting(false));
   };
@@ -5020,7 +7213,8 @@ function ImportTestPanel({ onClose, employees, managers }) {
     if (importedIds.length === 0) return;
     if (!confirm(`방금 저장한 ${importedIds.length}건을 전부 삭제할까요? (되돌릴 수 없어요)`)) return;
     setImporting(true);
-    Promise.all(importedIds.map((id) => window.VacationAPI.remove(id)))
+    Promise.resolve()
+      .then(() => Promise.all(importedIds.map((id) => window.VacationAPI.remove(id))))
       .then(() => {
         setImportedIds([]);
         setImportResult(null);
@@ -5044,7 +7238,8 @@ function ImportTestPanel({ onClose, employees, managers }) {
       return;
     if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
     setImporting(true);
-    window.VacationAPI.removeAllForBranch(branch)
+    Promise.resolve()
+      .then(() => window.VacationAPI.removeAllForBranch(branch))
       .then((count) => {
         alert(`${branch} 휴가 기록 ${count}건을 전부 삭제했어요.`);
         setImportedIds([]);
@@ -5054,10 +7249,38 @@ function ImportTestPanel({ onClose, employees, managers }) {
       .finally(() => setImporting(false));
   };
 
+  // 휴충당 신청 기록 전체 삭제 (경산 전용) - 테스트 데이터를 지우고 처음부터 다시 시작할 때
+  const handleResetHyuchungdang = () => {
+    if (
+      !confirm(
+        "⚠️ 휴충당 신청/지정 기록을 전부 삭제할까요?\n\n" +
+          "지금까지 신청·확정된 휴충당 기록이 전부 사라져요 (되돌릴 수 없어요). 휴가 기록은 안 건드려요."
+      )
+    )
+      return;
+    if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
+    setImporting(true);
+    Promise.resolve()
+      .then(() => {
+        if (!window.HyuchungdangAPI || typeof window.HyuchungdangAPI.removeAllForBranch !== "function") {
+          throw new Error(
+            "index.html에 HyuchungdangAPI.removeAllForBranch 함수가 아직 없어요. index.html을 먼저 업데이트해주세요."
+          );
+        }
+        return window.HyuchungdangAPI.removeAllForBranch("경산");
+      })
+      .then((count) => {
+        alert(`휴충당 기록 ${count}건을 전부 삭제했어요.`);
+      })
+      .catch((err) => alert("삭제 중 오류: " + (err && err.message ? err.message : err)))
+      .finally(() => setImporting(false));
+  };
+
   // 예전 코드로 저장된 "가져오기(자동확인)" 문구만 "확인"으로 바꿔주는 일회성 정리 (기존 기록은 그대로 유지)
   const handleFixAutoConfirmLabel = () => {
     setImporting(true);
-    window.VacationAPI.fixAutoConfirmLabel()
+    Promise.resolve()
+      .then(() => window.VacationAPI.fixAutoConfirmLabel())
       .then((count) => {
         alert(`"가져오기(자동확인)" 문구 ${count}건을 "확인"으로 정리했어요.`);
       })
@@ -5124,6 +7347,8 @@ function ImportTestPanel({ onClose, employees, managers }) {
                     <div style={modal.typeRow}>
                       {r.type || "(종류 없음)"}
                       {r.cancelled ? " · 취소됨" : ""}
+                      {r.reqDate ? ` · 신청일 ${r.reqDate}` : ""}
+                      {r.seq != null ? ` · 순번 ${r.seq}` : ""}
                     </div>
                   </div>
                 ))}
@@ -5225,6 +7450,14 @@ function ImportTestPanel({ onClose, employees, managers }) {
                   🗑️ 문양 전체 초기화 (모든 휴가 기록 삭제)
                 </button>
 
+                <button
+                  style={{ ...styles.button, border: "1px dashed #e08a20", color: "#e08a20", marginBottom: "14px", padding: "10px" }}
+                  disabled={importing}
+                  onClick={handleResetHyuchungdang}
+                >
+                  🔁 휴충당 전체 초기화 (경산 - 신청/지정 기록 삭제)
+                </button>
+
                 {converted.length === 0 && (
                   <div style={{ textAlign: "center", color: "#aaa", padding: "20px 0" }}>가져올 기록이 없어요</div>
                 )}
@@ -5238,6 +7471,15 @@ function ImportTestPanel({ onClose, employees, managers }) {
                       {c.vacationType} · {c.status}
                       {c.confirmedBy ? " · ✅확인됨" : " · 확인 대기중"}
                     </div>
+                    {c.createdAt ? (
+                      <div style={{ fontSize: "11px", color: "#1b3a5c", marginTop: "2px" }}>
+                        📅 신청일 인식됨: {formatEntryTime(c.createdAt, true)}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: "11px", color: "#e02020", marginTop: "2px" }}>
+                        ⚠️ 신청일 인식 실패 - 가져온 시각으로 기록돼요
+                      </div>
+                    )}
                     {c.isDeparted && (
                       <div style={{ fontSize: "11px", color: "#e08a20", marginTop: "2px" }}>
                         ⚠️ 현재 명단에 없는 사람 (집계 제외)
@@ -5256,4 +7498,8 @@ function ImportTestPanel({ onClose, employees, managers }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary onClose={() => window.location.reload()} closeLabel="새로고침">
+    <App />
+  </ErrorBoundary>
+);
