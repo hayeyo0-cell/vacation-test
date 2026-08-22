@@ -32,9 +32,11 @@ const BACKUP_FORCE_OVERDUE_MS = 9 * 24 * 60 * 60 * 1000; // 9일 (1주일 + 여�
 const BAND_URL = "https://band.us/band/51746678/chat/C4U1ay";
 
 const TEAM_MAP = { ks: "경산", my: "문양" }; // 안심(as)/월배(wb)는 이 앱 대상 아님
-// ⚠️ 테스트 모드: true면 누구나 교번확인/승인 없이 바로 들어갈 수 있어요.
-// 실제 운영 시작하면 반드시 false로 바꿔주세요!
-const TEST_MODE = false;
+// ⚠️ 테스트 모드: true면 누구나 교번확인/승인 없이 바로 들어갈 수 있고, "가져오기 테스트" 메뉴도 보여요.
+// 경산(index.html에 APP_STORAGE_SUFFIX 없음)은 항상 false, 문양테스트(APP_STORAGE_SUFFIX="_test")는
+// 항상 true로 자동 결정돼요 - app.js는 두 환경이 같은 파일을 공유하니, 여기서 직접 true/false를
+// 하드코딩하면 한쪽에만 맞고 다른 쪽은 틀어져요. 절대 이 줄을 손으로 true/false로 바꾸지 마세요.
+const TEST_MODE = window.APP_STORAGE_SUFFIX === "_test";
 
 const REVERSE_TEAM_MAP = { 경산: "ks", 문양: "my" };
 
@@ -3750,9 +3752,9 @@ assignPriority()
 
                 {managerFormType === "기타" && (
                   <div style={modal.formRow}>
-                    <label style={modal.label}>기타 사유</label>
+<label style={modal.label}>기타 사유</label>
                     <input
-                 style={modal.input}
+                      style={modal.input}
                       value={managerFormOtherReason}
                       onChange={(e) => setManagerFormOtherReason(e.target.value)}
                       placeholder="예: 예비군훈련, 법원 출석 등"
@@ -4378,17 +4380,15 @@ assignPriority()
                 🎋 명절 추첨 관리
               </button>
             )}
-            {TEST_MODE && (
-              <button
-                style={styles.button}
-                onClick={() => {
-                  setShowAdminMenu(false);
-                  openPanel(setShowImportTest);
-                }}
-              >
-                가져오기 테스트
-              </button>
-            )}
+            <button
+              style={styles.button}
+              onClick={() => {
+                setShowAdminMenu(false);
+                openPanel(setShowImportTest);
+              }}
+            >
+              가져오기 테스트
+            </button>
             <button
               style={{ ...styles.button, border: "1px dashed #e08a20", color: "#e08a20" }}
               onClick={() => {
