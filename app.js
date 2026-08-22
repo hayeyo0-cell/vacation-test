@@ -119,6 +119,17 @@ function isEvenMonthFirstDay() {
   return day === 1 && month % 2 === 0;
 }
 
+// 짝수달 1일 오전 9시~10시(오픈 직후 - 사람이 몰리고 신청/취소가 폭주하는 딱 그 시간대)인지 확인.
+// 이 좁은 창 안에서만 실시간 구독을 잠깐 켜서, 평소엔 안전한 1회 조회 방식을 그대로 유지하면서도
+// 정작 실시간 정확도가 제일 중요한 순간엔 자동 반영이 되도록 해요.
+// ⚠️ TEST_MODE에서는 항상 true로 간주해서 언제든 테스트해볼 수 있어요.
+function isPeakOpeningWindow() {
+  if (TEST_MODE) return true;
+  if (!isEvenMonthFirstDay()) return false;
+  const hour = koreaCurrentHour();
+  return hour === 9;
+}
+
 function parseLocalDate_(dateStr) {
   const [y, m, d] = String(dateStr).split("-").map(Number);
   return new Date(y, (m || 1) - 1, d || 1);
@@ -1842,6 +1853,12 @@ const VacFacade = {
       ? window.VacationDayAPI.getByRange(startStr, endStr, branch)
       : window.VacationAPI.getByRange(startStr, endStr, branch);
   },
+  // 짝수달 1일 오픈 직후 1시간 한정으로만 씀 - 그 외에는 절대 호출하지 마세요
+  subscribeRange(startStr, endStr, branch, callback) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.subscribeRange(startStr, endStr, branch, callback)
+      : window.VacationAPI.subscribeRange(startStr, endStr, branch, callback);
+  },
   // 본인 기록만 날짜 범위로 - 새 구조는 소속이 있어야 서버에서 걸러지니 branch가 항상 필요해요
   getMineByRange(employeeId, branch, fromDate, toDate) {
     return USE_DAY_DOCS
@@ -1904,7 +1921,7 @@ const VacFacade = {
       return window.VacationAPI.bulkImport(records).then((ids) =>
         ids.map((id, i) => ({ branch: records[i].branch || branch, date: records[i].date, id }))
       );
-      }
+    }
     const byDate = {};
     const resultRefs = [];
     records.forEach((r) => {
@@ -2346,6 +2363,12 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   const [viewYear, setViewYear] = useState(now.getFullYear());
   const [viewMonth, setViewMonth] = useState(now.getMonth()); // 0-indexed
   const [monthMap, setMonthMap] = useState({}); // { "YYYY-MM-DD": [records] }
+  // 짝수달 1일 오전 9시 진입/10시 퇴장을 놓치지 않도록 1분마다 다시 확인하는 용도 (그 외엔 의미 없는 값)
+  const [minuteTick, setMinuteTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setMinuteTick((v) => v + 1), 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
   const [loading, setLoading] = useState(true);
   const [holidaySet, setHolidaySet] = useState(new Set());
   const [selectedDate, setSelectedDate] = useState(null); // 모달용
@@ -2586,20 +2609,55 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   }, [currentUser.branch]);
 
   // 보고 있는 달이 바뀌거나(월 이동) 소속이 바뀌면(고스트모드 전환) 한 번만 다시 불러와요.
-  // (예전엔 실시간 구독(onSnapshot)이었는데, 무료 읽기 한도를 최대한 아끼려고
+  // (예전엔 항상 실시간 구독(onSnapshot)이었는데, 무료 읽기 한도를 최대한 아끼려고
   //  "켜놓은 동안 계속 감시"가 아니라 "필요할 때 한 번 조회"로 되돌렸어요.
   //  다른 사람이 그 사이에 신청/취소해도 자동으로는 안 보이고, 화면을 나갔다 들어오거나
   //  월을 넘겼다 다시 돌아오거나, 새로고침하면 그때 최신 상태로 반영돼요.
   //  본인이 직접 신청/취소/확인한 건 각 처리 함수에서 즉시 화면에 반영하니 이 effect와 무관해요.
-  //  살짝(200ms) 지연을 둬서, ‹ › 를 빠르게 여러 번 눌러 여러 달을 휙휙 지나칠 때
-  //  지나친 중간 달들까지 전부 조회하지 않고 최종적으로 멈춘 달만 조회하게 해요.
-  //  최신성엔 전혀 영향 없고, 순전히 낭비되는 중간 요청만 없애는 거예요.)
+  //
+  //  ⭐ 딱 하나 예외: 경산 짝수달 1일 오전 9시대(오픈 직후, 신청이 몰리는 그 1시간)만
+  //  자동으로 실시간 구독을 켜요. 새 구조(vacation_days)는 날짜당 문서 1개라 구독 비용도
+  //  하루 최대 31개뿐이라 예전(직원+날짜별) 구조보다 훨씬 저렴해요. 그 시간대가 지나면
+  //  자동으로 구독을 끊고 평소의 안전한 1회 조회 방식으로 돌아가요.)
   useEffect(() => {
+    const start = `${viewYear}-${pad2(viewMonth + 1)}-01`;
+    const lastDay = new Date(viewYear, viewMonth + 1, 0).getDate();
+    const end = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(lastDay)}`;
+    const usePeakSubscription = currentUser.branch === "경산" && isPeakOpeningWindow();
+
+    if (usePeakSubscription) {
+      setLoading(true);
+      let cancelled = false;
+      let unsubscribe = null;
+      waitForFirestore().then(() => {
+        if (cancelled) return;
+        unsubscribe = VacFacade.subscribeRange(start, end, currentUser.branch, (list) => {
+          const map = {};
+          (list || []).forEach((v) => {
+            if (!map[v.date]) map[v.date] = [];
+            map[v.date].push(v);
+          });
+          Object.values(map).forEach((arr) =>
+            arr.sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+          );
+          setMonthMap(map);
+          setLoading(false);
+        });
+      });
+      return () => {
+        cancelled = true;
+        if (unsubscribe) unsubscribe();
+      };
+    }
+
+    // 살짝(200ms) 지연을 둬서, ‹ › 를 빠르게 여러 번 눌러 여러 달을 휙휙 지나칠 때
+    // 지나친 중간 달들까지 전부 조회하지 않고 최종적으로 멈춘 달만 조회하게 해요.
+    // 최신성엔 전혀 영향 없고, 순전히 낭비되는 중간 요청만 없애는 거예요.
     const timer = setTimeout(() => {
       loadMonth(viewYear, viewMonth);
     }, 200);
     return () => clearTimeout(timer);
-  }, [viewYear, viewMonth, currentUser.branch, loadMonth]);
+  }, [viewYear, viewMonth, currentUser.branch, loadMonth, minuteTick]);
 
   const changeMonth = (delta) => {
     let y = viewYear;
@@ -3780,7 +3838,7 @@ assignPriority()
                 boxSizing: "border-box",
                 ...(isMidManager && isWideScreen
                   ? { height: "100%", overflowY: "auto", padding: "14px" }
-                  : {}),
+                    : {}),
               }}
             >
             <div
@@ -5700,7 +5758,7 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
         load();
       })
       .catch((err) => alert("생성 실패: " + (err && err.message ? err.message : err)))
-      .finally(() => setSaving(false));
+    .finally(() => setSaving(false));
   };
 
   const handleCloseApplication = (event) => {
@@ -5716,7 +5774,7 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
       return;
     const entries = entriesByEvent[event.id] || [];
     Promise.all(entries.map((en) => window.LotteryAPI.cancelApply(en.id)))
-    .then(() => window.LotteryAPI.removeEvent(event.id))
+      .then(() => window.LotteryAPI.removeEvent(event.id))
       .then(() => load())
       .catch((err) => alert("삭제 실패: " + (err && err.message ? err.message : err)));
   };
