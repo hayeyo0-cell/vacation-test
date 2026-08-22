@@ -3646,24 +3646,7 @@ assignPriority()
         <div style={cal.navRow}>
           <button style={cal.navBtn} onClick={() => changeMonth(-1)}>‹</button>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <div style={cal.monthTitle}>{viewYear}년 {viewMonth + 1}월</div>
-              <button
-                title="최신 정보로 새로고침"
-                style={{
-                  border: "none",
-                  background: "transparent",
-                  color: "#cfe0ff",
-                  fontSize: "15px",
-                  cursor: "pointer",
-                  padding: "2px",
-                }}
-                disabled={loading}
-                onClick={() => loadMonth(viewYear, viewMonth, true)}
-              >
-                🔄
-              </button>
-            </div>
+            <div style={cal.monthTitle}>{viewYear}년 {viewMonth + 1}월</div>
             {(viewYear !== now.getFullYear() || viewMonth !== now.getMonth()) && (
               <button
                 style={{
@@ -3849,7 +3832,7 @@ assignPriority()
               style={{ overflowX: "hidden" }}
               onTouchStart={handleDayTouchStart}
               onTouchMove={handleDayTouchMove}
-              onTouchEnd={handleDayTouchEnd}
+onTouchEnd={handleDayTouchEnd}
             >
               <div
                 ref={dayGridRef}
@@ -5761,7 +5744,7 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
         setApplyEnd("");
         load();
       })
-    .catch((err) => alert("생성 실패: " + (err && err.message ? err.message : err)))
+      .catch((err) => alert("생성 실패: " + (err && err.message ? err.message : err)))
       .finally(() => setSaving(false));
   };
 
