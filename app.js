@@ -699,7 +699,7 @@ function App() {
       waitForFirestore()
         .then(() =>
           Promise.all([
-            window.VacationAPI.deleteOlderThan(`${currentYear - 1}-01-01`),
+            VacFacade.deleteOlderThan(`${currentYear - 1}-01-01`),
             window.HyuchungdangAPI.deleteOlderThan(`${currentYear - 1}-01-01`),
           ])
         )
@@ -1880,6 +1880,49 @@ const VacFacade = {
       ? window.VacationDayAPI.remove(branch, dateStr, id)
       : window.VacationAPI.remove(id);
   },
+  // 소속 전체 (백업용) - 날짜 제한 없음
+  getAll(branch) {
+    return USE_DAY_DOCS ? window.VacationDayAPI.getAll(branch) : window.VacationAPI.getAll(branch);
+  },
+  // 기준일 이전 오래된 기록 정리 (연 1회 자동 실행)
+  deleteOlderThan(cutoffDate) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.deleteOlderThan(cutoffDate)
+      : window.VacationAPI.deleteOlderThan(cutoffDate);
+  },
+  // 소속 전체 삭제 (관리자 "전체 초기화" 버튼)
+  removeAllForBranch(branch) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.removeAllForBranch(branch)
+      : window.VacationAPI.removeAllForBranch(branch);
+  },
+  // 가져오기(스프레드시트 일괄 저장) - 새 구조에선 날짜별로 묶어서 bulkSetDays로 한 번에 써요.
+  // 두 구조 모두 { branch, date, id } 형태로 통일해서 반환해요 - 되돌리기(undo) 때
+  // 이 정보 그대로 VacFacade.remove(branch, date, id)를 호출하면 되게요.
+  bulkImport(branch, records) {
+    if (!USE_DAY_DOCS) {
+      return window.VacationAPI.bulkImport(records).then((ids) =>
+        ids.map((id, i) => ({ branch: records[i].branch || branch, date: records[i].date, id }))
+      );
+      }
+    const byDate = {};
+    const resultRefs = [];
+    records.forEach((r) => {
+      if (!r.date) return;
+      if (!byDate[r.date]) byDate[r.date] = {};
+      const entryId = `imp_${Math.random().toString(36).slice(2)}${Date.now()}`;
+      const { status, confirmedBy, ...rest } = r;
+      byDate[r.date][entryId] = {
+        ...rest,
+        status: status || "정상",
+        ...(confirmedBy ? { confirmedBy, confirmedAt: new Date() } : {}),
+        createdAt: r.createdAt || new Date(),
+        updatedAt: new Date(),
+      };
+      resultRefs.push({ branch: r.branch || branch, date: r.date, id: entryId });
+    });
+    return window.VacationDayAPI.bulkSetDays(branch, byDate).then(() => resultRefs);
+  },
 };
 
 // 야간/비번 짝을 조회만 해요 (취소·확인처럼 뭔가 바꾸지 않고, 있는지/뭔지만 확인) - 수정 시
@@ -2422,7 +2465,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
           const isPreferredWindow = hour >= BACKUP_PREFERRED_HOUR_START && hour < BACKUP_PREFERRED_HOUR_END;
           const isForceOverdue = overdueMs >= BACKUP_FORCE_OVERDUE_MS;
           if (!isPreferredWindow && !isForceOverdue) return null; // 새벽 시간대도 아니고 많이 밀리지도 않았으면 기다림
-          return window.VacationAPI.getAll(currentUser.branch).then((records) => {
+          return VacFacade.getAll(currentUser.branch).then((records) => {
             const payload = (records || [])
               .map((r) => ({
                 date: r.date || "",
@@ -3786,7 +3829,7 @@ assignPriority()
                         // 대상자를 고르면 그 사람 본인의 오늘 교번을 자동으로 채워줘요 - 운용이 매번
                         // 목록에서 그 사람 교번을 따로 찾아 고를 필요 없게. 물론 그 뒤에 자유롭게 바꿀 수 있어요.
                         setManagerFormDia(empId ? codeForEmployeeOnDate(empId, selectedDate) : "");
-                        }}
+                      }}
                     >
                       <option value="">이름 선택</option>
                       {[...branchAllEmployees]
@@ -5673,7 +5716,7 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
       return;
     const entries = entriesByEvent[event.id] || [];
     Promise.all(entries.map((en) => window.LotteryAPI.cancelApply(en.id)))
-      .then(() => window.LotteryAPI.removeEvent(event.id))
+    .then(() => window.LotteryAPI.removeEvent(event.id))
       .then(() => load())
       .catch((err) => alert("삭제 실패: " + (err && err.message ? err.message : err)));
   };
@@ -5694,7 +5737,7 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
       const winnerSetByDate = {};
       for (const dateInfo of event.dates) {
         const date = dateInfo.date;
-        const existing = await window.VacationAPI.getByDate(date, event.branch);
+        const existing = await VacFacade.getByDate(date, event.branch);
         const activeExisting = existing.filter((v) => v.status !== "취소됨");
         const activeCapacityCount = activeExisting.filter((v) => isCapacityType(v.vacationType)).length;
         activeCapacityCountByDate[date] = activeCapacityCount;
@@ -5772,8 +5815,7 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
         const isWinner = winnerSetByDate[en.date].has(en.id);
         await window.LotteryAPI.updateEntry(en.id, { result: isWinner ? "당첨" : "낙첨" });
         if (isWinner) {
-          const docId = `${en.employeeId}_${en.date}`;
-          await window.VacationAPI.addOnce(docId, {
+          await VacFacade.addOnce(en.branch, en.date, en.employeeId, {
             name: en.name,
             branch: en.branch,
             employeeId: en.employeeId,
@@ -6954,7 +6996,7 @@ function DataResetPanel({ onClose, branch, isSuperAdmin }) {
     if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
     setWorking(true);
     Promise.resolve()
-      .then(() => window.VacationAPI.removeAllForBranch("문양"))
+      .then(() => VacFacade.removeAllForBranch("문양"))
       .then((count) => {
         alert(`문양 휴가 기록 ${count}건을 전부 삭제했어요.`);
       })
@@ -7258,12 +7300,18 @@ function ImportTestPanel({ onClose, employees, managers }) {
 
     Promise.resolve()
       .then(() => {
-        if (!window.VacationAPI || typeof window.VacationAPI.bulkImport !== "function") {
+        if (USE_DAY_DOCS) {
+          if (!window.VacationDayAPI || typeof window.VacationDayAPI.bulkSetDays !== "function") {
+            throw new Error(
+              "index.html에 VacationDayAPI.bulkSetDays 함수가 아직 없어요. index.html을 먼저 업데이트해주세요."
+            );
+          }
+        } else if (!window.VacationAPI || typeof window.VacationAPI.bulkImport !== "function") {
           throw new Error(
             "index.html에 VacationAPI.bulkImport 함수가 아직 없어요. index.html을 먼저 업데이트해주세요."
           );
         }
-        return window.VacationAPI.bulkImport(payload);
+        return VacFacade.bulkImport("경산", payload);
       })
       .then((ids) => {
         setImportedIds((prev) => [...prev, ...ids]);
@@ -7282,7 +7330,7 @@ function ImportTestPanel({ onClose, employees, managers }) {
     if (!confirm(`방금 저장한 ${importedIds.length}건을 전부 삭제할까요? (되돌릴 수 없어요)`)) return;
     setImporting(true);
     Promise.resolve()
-      .then(() => Promise.all(importedIds.map((id) => window.VacationAPI.remove(id))))
+      .then(() => Promise.all(importedIds.map((ref) => VacFacade.remove(ref.branch, ref.date, ref.id))))
       .then(() => {
         setImportedIds([]);
         setImportResult(null);
@@ -7307,7 +7355,7 @@ function ImportTestPanel({ onClose, employees, managers }) {
     if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
     setImporting(true);
     Promise.resolve()
-      .then(() => window.VacationAPI.removeAllForBranch(branch))
+      .then(() => VacFacade.removeAllForBranch(branch))
       .then((count) => {
         alert(`${branch} 휴가 기록 ${count}건을 전부 삭제했어요.`);
         setImportedIds([]);
