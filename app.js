@@ -38,6 +38,11 @@ const TEAM_MAP = { ks: "경산", my: "문양" }; // 안심(as)/월배(wb)는 이
 // 하드코딩하면 한쪽에만 맞고 다른 쪽은 틀어져요. 절대 이 줄을 손으로 true/false로 바꾸지 마세요.
 const TEST_MODE = window.APP_STORAGE_SUFFIX === "_test";
 
+// ⚠️ 3단계 작업용 스위치: true면 휴가 데이터를 예전 구조(vacations) 대신 새 구조(vacation_days)로
+// 읽고 써요. 문양테스트버전에서 검증하는 동안만 true로 켜두고, 검증 끝나기 전까지 경산은 항상
+// false로 유지해주세요. false면 지금까지와 완전히 똑같이 작동해요 (기존 코드 그대로).
+const USE_DAY_DOCS = TEST_MODE;
+
 const REVERSE_TEAM_MAP = { 경산: "ks", 문양: "my" };
 
 // 운용(중간관리자) 명단은 더 이상 코드에 하드코딩하지 않고 Firestore(window.ManagerAPI)로 관리해요.
@@ -1527,7 +1532,7 @@ function isCapacityType(type) {
 // 삭제/취소 등으로 생긴 순번 구멍을 없애기 위해, 특정 날짜의 남은 보장휴가 순번을 1번부터 다시 매김
 // (여러 화면에서 같이 쓰는 공용 함수라 모듈 레벨에 둠 - MainScreen, MyVacationsPanel 등)
 function renumberDayPriorities_(dateStr, branch, onDone) {
-  window.VacationAPI.getByDate(dateStr, branch)
+  VacFacade.getByDate(dateStr, branch)
     .then((records) => {
       // 취소된 기록도 그 번호를 계속 차지해요 (취소됐다고 뒷사람이 번호를 당겨쓰지 않아요) -
       // 그래서 취소 여부와 상관없이, 그날 전체 기록을 입력 시각 순서로 쭉 번호 매겨요.
@@ -1547,10 +1552,10 @@ function renumberDayPriorities_(dateStr, branch, onDone) {
       capacityAll.forEach((v, idx) => {
         const newPriority = idx + 1;
         if (v.priority !== newPriority) {
-          updates.push(window.VacationAPI.update(v.id, { priority: newPriority }));
+          updates.push(VacFacade.update(v.branch, v.date, v.id, { priority: newPriority }));
         }
       });
-      return Promise.all(updates).then(() => window.VacationAPI.getByDate(dateStr, branch));
+      return Promise.all(updates).then(() => VacFacade.getByDate(dateStr, branch));
     })
     .then((freshRecords) => {
       // 그날이 속한 달의 달력 캐시를 지워둬요 - 순번이 바뀐 채로 캐시가 오래 남지 않게
@@ -1754,7 +1759,7 @@ function cancelNightPairIfAny(record, onPairCancelled) {
   // 문서 ID를 추측하지 않고, 그 날짜 기록 중 같은 직원ID를 찾아요.
   // (본인이 앱에서 직접 신청한 건 "직원ID_날짜" 고정ID지만, 가져오기/대신기록으로 들어온 건
   //  Firestore가 임의로 만든 ID라서 ID 추측 방식으로는 못 찾기 때문)
-  return window.VacationAPI.getByDate(pairDate, record.branch)
+  return VacFacade.getByDate(pairDate, record.branch)
     .then((records) => {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
@@ -1764,7 +1769,7 @@ function cancelNightPairIfAny(record, onPairCancelled) {
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
         : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType];
       if (!valid) return null;
-      return window.VacationAPI.cancel(pairRecord.id).then(() => {
+      return VacFacade.cancel(pairRecord.branch, pairRecord.date, pairRecord.id).then(() => {
         if (onPairCancelled) onPairCancelled(pairRecord);
         return pairRecord;
       });
@@ -1792,7 +1797,7 @@ function confirmNightPairIfAny(record, managerName, onPairConfirmed) {
   }
   if (!pairDate) return Promise.resolve(null);
 
-  return window.VacationAPI.getByDate(pairDate, record.branch)
+  return VacFacade.getByDate(pairDate, record.branch)
     .then((records) => {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
@@ -1802,7 +1807,7 @@ function confirmNightPairIfAny(record, managerName, onPairConfirmed) {
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
         : !!NIGHT_COMPANION_TYPE_MAP[pairRecord.vacationType];
       if (!valid) return null;
-      return window.VacationAPI.confirm(pairRecord.id, managerName).then(() => {
+      return VacFacade.confirm(pairRecord.branch, pairRecord.date, pairRecord.id, managerName).then(() => {
         const confirmedPair = { ...pairRecord, confirmedBy: managerName };
         if (onPairConfirmed) onPairConfirmed(confirmedPair);
         return confirmedPair;
@@ -1813,6 +1818,59 @@ function confirmNightPairIfAny(record, managerName, onPairConfirmed) {
       return null;
     });
 }
+
+/* ------------------------------------------------------------------ */
+/* VacFacade - 3단계 전환용 어댑터                                       */
+/* USE_DAY_DOCS 스위치 하나로 예전 구조(VacationAPI)/새 구조(VacationDayAPI)*/
+/* 중 어디로 보낼지 여기서만 결정해요. 호출하는 쪽 코드는 이 함수들만 쓰면   */
+/* 되고, 어느 구조를 쓰는지 신경 안 써도 돼요.                            */
+/* 쓰기 계열은 새 구조에서 branch+date가 있어야 문서를 찾을 수 있어서,      */
+/* 예전 구조만 쓸 때보다 인자가 하나씩(branch, dateStr) 더 필요해요.       */
+/* ------------------------------------------------------------------ */
+const VacFacade = {
+  getByDate(dateStr, branch) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.getByDate(dateStr, branch)
+      : window.VacationAPI.getByDate(dateStr, branch);
+  },
+  getByRange(startStr, endStr, branch) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.getByRange(startStr, endStr, branch)
+      : window.VacationAPI.getByRange(startStr, endStr, branch);
+  },
+  // 본인 신청 전용 - employeeId당 하루 1건 중복 방지가 자동으로 보장돼요
+  addOnce(branch, dateStr, employeeId, record) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.addOnce(branch, dateStr, employeeId, record)
+      : window.VacationAPI.addOnce(`${employeeId}_${dateStr}`, record);
+  },
+  // 관리자 대신기록/배정 등 - 같은 사람이 하루에 여러 건 가능
+  add(branch, dateStr, record) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.add(branch, dateStr, record)
+      : window.VacationAPI.add(record);
+  },
+  update(branch, dateStr, id, patch) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.update(branch, dateStr, id, patch)
+      : window.VacationAPI.update(id, patch);
+  },
+  cancel(branch, dateStr, id) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.cancel(branch, dateStr, id)
+      : window.VacationAPI.cancel(id);
+  },
+  confirm(branch, dateStr, id, managerName) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.confirm(branch, dateStr, id, managerName)
+      : window.VacationAPI.confirm(id, managerName);
+  },
+  remove(branch, dateStr, id) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.remove(branch, dateStr, id)
+      : window.VacationAPI.remove(id);
+  },
+};
 
 // 야간/비번 짝을 조회만 해요 (취소·확인처럼 뭔가 바꾸지 않고, 있는지/뭔지만 확인) - 수정 시
 // "짝이 있는지, 있다면 뭘 맞춰줘야 하는지" 판단하는 데 써요.
@@ -1827,11 +1885,11 @@ function findNightPair(record) {
     expectCompanion = false;
   }
   if (!pairDate) return Promise.resolve(null);
-  return window.VacationAPI.getByDate(pairDate, record.branch)
+  return VacFacade.getByDate(pairDate, record.branch)
     .then((records) => {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
-      );
+        );
       if (!pairRecord) return null;
       const valid = expectCompanion
         ? !!NIGHT_COMPANION_TYPES_REVERSE[pairRecord.vacationType]
@@ -2455,7 +2513,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     const lastDay = new Date(y, m + 1, 0).getDate();
     const end = `${y}-${pad2(m + 1)}-${pad2(lastDay)}`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getByRange(start, end, currentUser.branch))
+      .then(() => VacFacade.getByRange(start, end, currentUser.branch))
       .then((list) => {
         const map = {};
         (list || []).forEach((v) => {
@@ -2701,7 +2759,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
 
   const handleCancel = (record) => {
     if (!confirm(`${record.name}님의 ${record.vacationType} 기록을 취소할까요?`)) return;
-    window.VacationAPI.cancel(record.id).then(() => {
+    VacFacade.cancel(record.branch, record.date, record.id).then(() => {
       // 모달 내 목록에 즉시 "취소됨" 표시 (순번 재정렬 전, 빠른 화면 반응용)
       setMonthMap((prev) => {
         const next = { ...prev };
@@ -2816,7 +2874,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     const savedDia = formDia.trim();
     let companionSaved = false;
 
-    window.VacationAPI.addOnce(docId, {
+    VacFacade.addOnce(currentUser.branch, selectedDate, currentUser.id, {
       name: currentUser.name,
       branch: currentUser.branch,
       employeeId: currentUser.id,
@@ -2828,7 +2886,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
       .then(() => {
         if (!shouldAddCompanion) return;
         // 야간 신청이면 다음날 "비번" 기록도 같이 자동 등록해요 (연차→연차비, 분지→분지비, 장재→장재비)
-        return window.VacationAPI.addOnce(companionDocId, {
+        return VacFacade.addOnce(currentUser.branch, nextDateStr, currentUser.id, {
           name: currentUser.name,
           branch: currentUser.branch,
           employeeId: currentUser.id,
@@ -2898,9 +2956,9 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     waitForFirestore()
       .then(() =>
         Promise.all([
-          window.VacationAPI.getByDate(selectedDate, currentUser.branch),
-          prevDateStr ? window.VacationAPI.getByDate(prevDateStr, currentUser.branch) : Promise.resolve([]),
-          isNightFormEntry && nextDateStr ? window.VacationAPI.getByDate(nextDateStr, currentUser.branch) : Promise.resolve([]),
+          VacFacade.getByDate(selectedDate, currentUser.branch),
+          prevDateStr ? VacFacade.getByDate(prevDateStr, currentUser.branch) : Promise.resolve([]),
+          isNightFormEntry && nextDateStr ? VacFacade.getByDate(nextDateStr, currentUser.branch) : Promise.resolve([]),
         ])
       )
       .then(([freshDayRecords, prevDayRecords, nextDayRecords]) => {
@@ -3722,7 +3780,7 @@ assignPriority()
                     >
                       <option value="">이름 선택</option>
                       {[...branchAllEmployees]
-                        .sort((a, b) => a.name.localeCompare(b.name, "ko"))
+                       .sort((a, b) => a.name.localeCompare(b.name, "ko"))
                         .map((emp) => (
                           <option key={emp.id} value={emp.id}>{emp.name}</option>
                         ))}
@@ -3752,7 +3810,7 @@ assignPriority()
 
                 {managerFormType === "기타" && (
                   <div style={modal.formRow}>
-<label style={modal.label}>기타 사유</label>
+                    <label style={modal.label}>기타 사유</label>
                     <input
                       style={modal.input}
                       value={managerFormOtherReason}
