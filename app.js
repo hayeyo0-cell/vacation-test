@@ -1842,6 +1842,12 @@ const VacFacade = {
       ? window.VacationDayAPI.getByRange(startStr, endStr, branch)
       : window.VacationAPI.getByRange(startStr, endStr, branch);
   },
+  // 본인 기록만 날짜 범위로 - 새 구조는 소속이 있어야 서버에서 걸러지니 branch가 항상 필요해요
+  getMineByRange(employeeId, branch, fromDate, toDate) {
+    return USE_DAY_DOCS
+      ? window.VacationDayAPI.getMineByRange(employeeId, branch, fromDate, toDate)
+      : window.VacationAPI.getMineByRange(employeeId, fromDate, toDate);
+  },
   // 본인 신청 전용 - employeeId당 하루 1건 중복 방지가 자동으로 보장돼요
   addOnce(branch, dateStr, employeeId, record) {
     return USE_DAY_DOCS
@@ -1890,7 +1896,7 @@ function findNightPair(record) {
   }
   if (!pairDate) return Promise.resolve(null);
   return VacFacade.getByDate(pairDate, record.branch)
-  .then((records) => {
+    .then((records) => {
       const pairRecord = (records || []).find(
         (r) => r.employeeId === record.employeeId && r.status !== "취소됨"
       );
@@ -2387,7 +2393,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     d.setDate(d.getDate() + 5);
     const limit = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getMineByRange(currentUser.id, today, limit))
+      .then(() => VacFacade.getMineByRange(currentUser.id, currentUser.branch, today, limit))
       .then((records) => {
         const upcoming = (records || [])
           .filter((v) => v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
@@ -2501,7 +2507,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     d.setDate(d.getDate() + 5);
     const limit = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     waitForFirestore()
-      .then(() => window.VacationAPI.getByRange(today, limit, currentUser.branch))
+      .then(() => VacFacade.getByRange(today, limit, currentUser.branch))
       .then((records) => {
         const upcoming = (records || [])
           .filter((v) => v.status !== "취소됨" && !v.confirmedBy && isCapacityType(v.vacationType))
@@ -2677,12 +2683,12 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     const prevPromise = prevInSameMonth
       ? Promise.resolve((monthMap[prevDateStr] || []).filter((v) => v.branch === currentUser.branch))
       : prevDateStr
-      ? waitForFirestore().then(() => window.VacationAPI.getByDate(prevDateStr, currentUser.branch))
+      ? waitForFirestore().then(() => VacFacade.getByDate(prevDateStr, currentUser.branch))
       : Promise.resolve([]);
     const nextPromise = nextInSameMonth
       ? Promise.resolve((monthMap[nextDateStr] || []).filter((v) => v.branch === currentUser.branch))
       : nextDateStr
-      ? waitForFirestore().then(() => window.VacationAPI.getByDate(nextDateStr, currentUser.branch))
+      ? waitForFirestore().then(() => VacFacade.getByDate(nextDateStr, currentUser.branch))
       : Promise.resolve([]);
 
     Promise.all([prevPromise, nextPromise])
@@ -3121,7 +3127,7 @@ setManagerSaving(true);
 // 다음 번호로. "대상자 미정"이나 보장인원 미포함 항목(기타 등)은 순번 자체가 필요 없어요.
 const assignPriority = () => {
   if (managerFormUnassigned || !isCapacityType(finalVacationType)) return Promise.resolve(null);
-  return window.VacationAPI.getByDate(selectedDate, currentUser.branch).then((dayRecords) => {
+  return VacFacade.getByDate(selectedDate, currentUser.branch).then((dayRecords) => {
     const count = (dayRecords || []).filter(
       (v) => isCapacityType(v.vacationType)
     ).length;
@@ -3156,7 +3162,7 @@ assignPriority()
       ...(managerFormUnassigned ? { unassigned: true } : {}),
       ...(managerFormNote.trim() ? { note: managerFormNote.trim() } : {}),
     };
-    return window.VacationAPI.add(newRecord).then((id) => ({ id, ...newRecord }));
+    return VacFacade.add(currentUser.branch, selectedDate, newRecord).then((id) => ({ id, ...newRecord }));
   })
     .then((savedRecord) => {
       if (!shouldAddCompanion) return { savedRecord, companionRecord: null };
@@ -3169,7 +3175,7 @@ assignPriority()
         date: nextDateStr,
         recordedBy: currentUser.name,
       };
-      return window.VacationAPI.add(companionRecord)
+      return VacFacade.add(currentUser.branch, nextDateStr, companionRecord)
         .then((id) => {
           return { savedRecord, companionRecord: { id, ...companionRecord } };
         })
@@ -3248,7 +3254,7 @@ assignPriority()
     }
     if (!confirm(`${target.name}님 / ${assignDia}(으)로 배정할까요?`)) return;
 
-    window.VacationAPI.remove(record.id)
+    VacFacade.remove(record.branch, record.date, record.id)
       .then(() => {
         const newRecord = {
           name: target.name,
@@ -3260,7 +3266,7 @@ assignPriority()
           recordedBy: currentUser.name,
           ...(record.note ? { note: record.note } : {}),
         };
-        return window.VacationAPI.add(newRecord).then((id) => ({ id, ...newRecord }));
+        return VacFacade.add(currentUser.branch, record.date, newRecord).then((id) => ({ id, ...newRecord }));
       })
       .then((savedRecord) => {
         setAssigningRecordId(null);
@@ -3780,9 +3786,9 @@ assignPriority()
                         // 대상자를 고르면 그 사람 본인의 오늘 교번을 자동으로 채워줘요 - 운용이 매번
                         // 목록에서 그 사람 교번을 따로 찾아 고를 필요 없게. 물론 그 뒤에 자유롭게 바꿀 수 있어요.
                         setManagerFormDia(empId ? codeForEmployeeOnDate(empId, selectedDate) : "");
-                      }}
+                        }}
                     >
-                        <option value="">이름 선택</option>
+                      <option value="">이름 선택</option>
                       {[...branchAllEmployees]
                         .sort((a, b) => a.name.localeCompare(b.name, "ko"))
                         .map((emp) => (
@@ -4836,7 +4842,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
     waitForFirestore()
       .then(() =>
         Promise.all([
-          window.VacationAPI.getMineByRange(currentUser.id, fromDate, toDate),
+          VacFacade.getMineByRange(currentUser.id, currentUser.branch, fromDate, toDate),
           currentUser.branch === "경산"
             ? window.HyuchungdangAPI.listMineFrom(currentUser.id, dayBeforeThisYear)
             : Promise.resolve([]),
@@ -4903,7 +4909,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
       return;
     }
     if (!confirm(`${record.date} ${record.vacationType} 기록을 취소할까요?`)) return;
-    window.VacationAPI.cancel(record.id).then(() => {
+    VacFacade.cancel(record.branch, record.date, record.id).then(() => {
       setList((prev) => prev.map((v) => (v.id === record.id ? { ...v, status: "취소됨" } : v)));
       // 취소로 순번에 구멍이 생기니, 같은 날짜의 남은 보장휴가 기록들 순번을 다시 매겨요
       if (isCapacityType(record.vacationType)) {
@@ -4945,7 +4951,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
     setEditSaving(true);
     findNightPair(record)
       .then((pairRecord) =>
-        window.VacationAPI.update(record.id, { vacationType: editType, dia: trimmedDia }).then(
+        VacFacade.update(record.branch, record.date, record.id, { vacationType: editType, dia: trimmedDia }).then(
           () => pairRecord
         )
       )
@@ -4961,7 +4967,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
         const stillNight = newCompanionType && isNightShiftCode(trimmedDia, record.branch);
         if (stillNight) {
           const newCompanionDia = nightDiaToOffDutyDia(trimmedDia);
-          return window.VacationAPI.update(pairRecord.id, {
+          return VacFacade.update(pairRecord.branch, pairRecord.date, pairRecord.id, {
             vacationType: newCompanionType,
             dia: newCompanionDia,
           }).then(() => {
@@ -4974,7 +4980,7 @@ function MyVacationsPanel({ currentUser, onClose, employees }) {
             );
           });
         }
-        return window.VacationAPI.cancel(pairRecord.id).then(() => {
+        return VacFacade.cancel(pairRecord.branch, pairRecord.date, pairRecord.id).then(() => {
           setList((prev) =>
             prev.some((v) => v.id === pairRecord.id)
               ? prev.map((v) => (v.id === pairRecord.id ? { ...v, status: "취소됨" } : v))
