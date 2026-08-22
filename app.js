@@ -1728,7 +1728,7 @@ function isNightShiftCode(dia, branch) {
 }
 
 // 야간 근무 신청 시 자동으로 같이 등록/취소되는 "비번" 짝 - 휴가종류 매핑
-const NIGHT_COMPANION_TYPE_MAP = { 연차: "연차비", 분지: "분지비", 장재: "장재비" };
+const NIGHT_COMPANION_TYPE_MAP = { 연차: "연차비", 분지: "분지비", 장재: "장재비", 병가: "병가비", 청휴: "청휴비" };
 const NIGHT_COMPANION_TYPES_REVERSE = Object.fromEntries(
   Object.entries(NIGHT_COMPANION_TYPE_MAP).map(([parent, companion]) => [companion, parent])
 );
@@ -2842,7 +2842,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
   // 야간 근무 신청 시 - 다음날이 이미 꽉 차서 비번 자리를 못 받는 경우를 미리 확인 (경산·문양 공통)
   const isNightFormEntry = selectedDate && isNightShiftCode(formDia, currentUser.branch);
   const nightNextDayBlock =
-    isNightFormEntry && nextDateStr
+    isNightFormEntry && nextDateStr && isCapacityType(formType)
       ? (() => {
           const nextDayActive = (monthMap[nextDateStr] || []).filter(
             (v) => v.branch === currentUser.branch && v.status !== "취소됨"
@@ -2980,7 +2980,7 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
     const docId = `${currentUser.id}_${selectedDate}`; // 직원ID_날짜 고정 ID - 중복 신청 원천 차단
     const companionType = NIGHT_COMPANION_TYPE_MAP[formType];
     const shouldAddCompanion =
-      isNightFormEntry && companionType && nextDateStr && isCapacityType(formType);
+      isNightFormEntry && companionType && nextDateStr;
     const companionDocId = shouldAddCompanion ? `${currentUser.id}_${nextDateStr}` : null;
     const savedDia = formDia.trim();
     let companionSaved = false;
@@ -3102,25 +3102,30 @@ function MainScreen({ currentUser: realCurrentUser, employees, managers, onSwitc
           return;
         }
 
-        // 야간 근무면 다음날 비번 자리가 실제로 남아있는지도 최신 데이터로 재확인
+        // 야간 근무면 다음날 상황도 최신 데이터로 재확인해요
         if (isNightFormEntry && nextDateStr) {
           const nextDayActive = (nextDayRecords || []).filter(
             (v) => v.branch === currentUser.branch && v.status !== "취소됨"
           );
-          const nextDayCapacityCount = nextDayActive.filter((v) => isCapacityType(v.vacationType)).length;
-          const nextDayCapacity = gyeongsanCapacity(currentUser.branch, nextDateStr, nextDayActive, holidaySet, [
-            { dia: formDia },
-          ]);
-          if (nextDayCapacityCount >= nextDayCapacity) {
-            setSaving(false);
-            alert(
-              `앗, 다음날(${nextDateStr})이 이미 다 차서 야간 신청을 저장할 수 없어요. 다른 날짜를 선택해주세요.`
-            );
-            loadMonth(viewYear, viewMonth);
-            setShowRegisterForm(false);
-            return;
+          // 보장인원 포함 종류(연차/분지/장재)만 다음날 자리(정원) 확인이 필요해요.
+          // 청휴비/병가비 같은 미포함 짝은 자리를 안 차지하니 이 확인 자체가 필요 없어요.
+          if (isCapacityType(formType)) {
+            const nextDayCapacityCount = nextDayActive.filter((v) => isCapacityType(v.vacationType)).length;
+            const nextDayCapacity = gyeongsanCapacity(currentUser.branch, nextDateStr, nextDayActive, holidaySet, [
+              { dia: formDia },
+            ]);
+            if (nextDayCapacityCount >= nextDayCapacity) {
+              setSaving(false);
+              alert(
+                `앗, 다음날(${nextDateStr})이 이미 다 차서 야간 신청을 저장할 수 없어요. 다른 날짜를 선택해주세요.`
+              );
+              loadMonth(viewYear, viewMonth);
+              setShowRegisterForm(false);
+              return;
+            }
           }
           // 다음날에 본인이 이미 다른 기록을 갖고 있으면, 비번 자동등록이 그 기록을 덮어쓸 수 있어 미리 막아요
+          // (종류(capacity 여부)와 무관하게 항상 확인해야 해요)
           if (NIGHT_COMPANION_TYPE_MAP[formType] && nextDayActive.some((v) => v.employeeId === currentUser.id)) {
             setSaving(false);
             alert(
@@ -3243,7 +3248,6 @@ const shouldAddCompanion =
   !managerFormUnassigned &&
   companionType &&
   nextDateStr &&
-  isCapacityType(finalVacationType) &&
   isNightShiftCode(finalDia, currentUser.branch);
 
 assignPriority()
@@ -3838,7 +3842,7 @@ assignPriority()
                 boxSizing: "border-box",
                 ...(isMidManager && isWideScreen
                   ? { height: "100%", overflowY: "auto", padding: "14px" }
-                    : {}),
+                  : {}),
               }}
             >
             <div
@@ -5757,8 +5761,8 @@ function LotteryAdminPanel({ branch, isSuperAdmin, onClose, employees, managers,
         setApplyEnd("");
         load();
       })
-      .catch((err) => alert("생성 실패: " + (err && err.message ? err.message : err)))
-    .finally(() => setSaving(false));
+    .catch((err) => alert("생성 실패: " + (err && err.message ? err.message : err)))
+      .finally(() => setSaving(false));
   };
 
   const handleCloseApplication = (event) => {
