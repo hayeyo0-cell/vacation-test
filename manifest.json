@@ -1,6 +1,6 @@
 {
-  "name": "D휴가(문양)",
-  "short_name": "D휴가문양",
+  "name": "D휴가 문양",
+  "short_name": "D휴가 문양",
   "description": "문양승무팀 휴가 관리 앱",
   "start_url": "./index.html",
   "scope": "./",
