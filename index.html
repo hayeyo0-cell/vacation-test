@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>D휴가(문양테스트)</title>
+<title>D휴가(문양)</title>
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="icon-192.png" />
 <link rel="apple-touch-icon" href="icon-192.png" />
@@ -43,7 +43,6 @@
 
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
@@ -246,7 +245,7 @@
   };
 
   /* ==================================================================== */
-  /* VacationDayAPI - 신규 구조 (실험용, 아직 app.js에서 안 씀)               */
+  /* VacationDayAPI - 신규 구조 (실사용 중)                                    */
   /* "직원+날짜당 문서 1개" 대신 "소속+날짜당 문서 1개"로 묶어서,               */
   /* 한 달 달력을 볼 때 200~300개 문서 대신 그 달의 일수(최대 31개)만          */
   /* 읽으면 되도록 구조를 바꿔요. 캐싱이 아니라 데이터 자체를 이렇게 저장하는   */
@@ -317,7 +316,8 @@
     },
 
     // 새 기록 추가 (본인 신청용) - employeeId당 하루 1건 제한을 트랜잭션으로 안전하게 보장해요.
-    async addOnce(branch, dateStr, employeeId, record) {
+    // guard(선택): 트랜잭션 안에서 "그 순간의 최신 기록 목록"을 받아 검사하는 함수. 정원 초과 등이면 throw해서 저장을 막아요.
+    async addOnce(branch, dateStr, employeeId, record, guard) {
       const ref = doc(db, DAYS_COLLECTION, dayDocId_(branch, dateStr));
       const entryId = `${employeeId}_${dateStr}`; // 직원당 하루 1건 - 기존 문서ID 규칙 그대로 재사용
       await runTransaction(db, async (tx) => {
@@ -327,6 +327,10 @@
         const existing = entries[entryId];
         if (existing && existing.status !== "취소됨") {
           throw new Error("DUPLICATE_ENTRY");
+        }
+        // 저장 직전 최종 검증 - 다른 사람이 동시에 신청해도 트랜잭션이 재시도되며 여기서 다시 확인돼요
+        if (typeof guard === "function") {
+          guard(Object.entries(entries).map(([id, e]) => ({ id, ...e })));
         }
         entries[entryId] = {
           ...record,
@@ -666,6 +670,17 @@
 
   // 자동 백업(주 1회) 관련 - 마지막 백업 시각을 저장/조회
   window.SystemAPI = {
+    // 교번 변경 예약 목록 - 문서 1개(system/roster_changes)에 배열로 저장해요 (앱 켤 때 읽기 1회)
+    async getRosterChanges() {
+      const snap = await getDoc(doc(db, SYSTEM_COLLECTION, "roster_changes"));
+      return snap.exists() ? (snap.data().items || []) : [];
+    },
+    async saveRosterChanges(items) {
+      await setDoc(doc(db, SYSTEM_COLLECTION, "roster_changes"), {
+        items,
+        updatedAt: serverTimestamp(),
+      });
+    },
     async getBackupMeta() {
       const snap = await getDoc(doc(db, SYSTEM_COLLECTION, "backup_meta"));
       return snap.exists() ? snap.data() : null;
@@ -698,10 +713,12 @@
   window.dispatchEvent(new Event("firestore-ready"));
 </script>
 
-<!-- 이 앱만의 로그인정보/캐시 저장 구분용 (휴가앱 실사용과 데이터 안 섞이게) -->
+<!-- 이 앱만의 로그인정보/캐시 저장 구분용 (경산 휴가앱과 데이터 안 섞이게) - 이 값은 바꾸지 마세요 -->
 <script>window.APP_STORAGE_SUFFIX = "_test";</script>
+<!-- 테스트 모드 스위치: 실사용 전환 시 false로만 바꾸면 돼요 -->
+<script>window.APP_TEST_MODE = true;</script>
 
-<script type="text/babel" src="app.js?v=20260819"></script>
+<script src="app.js?v=20261001my2"></script>
 
 <script>
   if ("serviceWorker" in navigator) {
