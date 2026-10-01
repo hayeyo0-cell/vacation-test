@@ -1,6 +1,8 @@
 // sw.js - 최소한의 서비스워커 (PWA 설치 조건 충족 + 기본 오프라인 지원)
 // v2: 캐시 우선 → 네트워크 우선으로 변경 (온라인일 땐 항상 최신 버전, 오프라인일 때만 캐시 사용)
-const CACHE_NAME = "vacation-app-v2";
+// 문양 앱 전용 캐시 이름 - 경산 휴가앱과 같은 주소(origin)라 캐시 저장소를 같이 써서, 이름을 분리했어요.
+const CACHE_PREFIX = "vacation-munyang-";
+const CACHE_NAME = CACHE_PREFIX + "v1";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -20,7 +22,8 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      // 내 앱(문양)의 옛 버전 캐시만 지워요 - 경산 앱 캐시는 건드리지 않아요
+      Promise.all(keys.filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_NAME).map((k) => caches.delete(k)))
     )
   );
   self.clients.claim();
