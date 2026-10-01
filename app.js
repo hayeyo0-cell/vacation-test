@@ -303,6 +303,26 @@ function recomputeTodayCodesFromCache(cache) {
 function isGuestAdminRow_(r) {
   return r.team !== "my" && SUPER_ADMIN_NAMES.includes(r.name) && ADMIN_NAMES.some(a => a.name === r.name && a.branch === "문양");
 }
+// 관리용 게스트(권재림 등)가 로그인할 때 고른 "오늘 교번"을 기준일(BASE_DATE) 교번으로 되돌려 저장해요.
+// 이렇게 해두면 날짜가 지나도 달력의 교번이 교번틀대로 자연스럽게 흘러가요 (진짜 직원과 같은 방식).
+function guestBaseCodeFromToday_(todayCode) {
+  const order = GYOBUN_ORDER.my || [];
+  const offset = BASE_DATE ? diffDays_(BASE_DATE, koreaTodayStr()) : 0;
+  return shiftCodeByDays_(order, todayCode, -offset);
+}
+// 게스트 본인용 가상 명단 항목 - 화면 명단(대신기록 대상자 등)엔 안 넣고, "내 교번" 계산에만 써요
+function guestRosterEntry_(user) {
+  if (!user || !user.guestBaseCode) return null;
+  const order = GYOBUN_ORDER.my || [];
+  const offset = BASE_DATE ? diffDays_(BASE_DATE, koreaTodayStr()) : 0;
+  return {
+    id: user.id,
+    name: user.name,
+    branch: "문양",
+    baseCode: user.guestBaseCode,
+    code: shiftCodeByDays_(order, user.guestBaseCode, offset)
+  };
+}
 // 화면(MainScreen) 쪽에 넘길 명단 - 관리용 게스트는 빼요
 function realEmployees_(list) {
   return (list || []).filter(e => !e.adminGuest);
@@ -907,14 +927,31 @@ function App() {
     setStep("nameAndCode");
   };
   const branchOrder = GYOBUN_ORDER[REVERSE_TEAM_MAP[branch]] || [];
-  const templateCodes = branchOrder.filter(c => branchEmployees.some(e => e.code === c));
+  const realBranchEmployees = branchEmployees.filter(e => !e.adminGuest);
+  const templateCodes = branchOrder.filter(c => realBranchEmployees.some(e => e.code === c));
   // 교번틀에 없는 코드(갑/을/병/현업일근 등 중간관리자 근무형태)도 뒤에 붙여서 보여줌
-  const otherCodes = [...new Set(branchEmployees.map(e => e.code))].filter(c => !templateCodes.includes(c));
-  const branchCodes = [...templateCodes, ...otherCodes];
+  const otherCodes = [...new Set(realBranchEmployees.map(e => e.code))].filter(c => !templateCodes.includes(c));
+  // 관리용 게스트(권재림)는 테스트용으로 문양 교번틀 전체 중 아무 교번이나 골라서 들어갈 수 있어요
+  const branchCodes = selectedNameEntry && selectedNameEntry.adminGuest ? [...branchOrder] : [...templateCodes, ...otherCodes];
   const handleConfirmNameCode = () => {
     const emp = nameOptions.find(e => e.id === pendingNameId);
     if (!emp) {
       alert("이름을 선택해주세요");
+      return;
+    }
+
+    // 관리용 게스트(권재림): 교번 일치 확인 없이, 고른 교번을 "내 교번"으로 삼아 들어가요 (테스트용)
+    if (emp.adminGuest) {
+      if (!pendingCode) {
+        alert("교번을 선택해주세요");
+        return;
+      }
+      setSelectedEmp({
+        ...emp,
+        code: pendingCode,
+        guestBaseCode: guestBaseCodeFromToday_(pendingCode)
+      });
+      setStep("setPin");
       return;
     }
 
@@ -978,6 +1015,9 @@ function App() {
       id: selectedEmp.id,
       name: selectedEmp.name,
       branch: selectedEmp.branch,
+      ...(selectedEmp.guestBaseCode ? {
+        guestBaseCode: selectedEmp.guestBaseCode
+      } : {}),
       pin
     }];
     saveLocalAuth(updated);
@@ -2607,7 +2647,7 @@ function MainScreen({
   // 본인 기록 찾기 - 이름+소속으로 우선 찾아요 (스프레드시트에서 "직원ID는 고정, 이름을 서로
   // 바꿔서 자리를 교체하는" 운영 방식과 맞추기 위해서예요 - 교번앱도 이 방식으로 동작해요).
   // 혹시 이름이 명단에서 아예 안 보이면 ID로도 한 번 더 찾아봐요 (최후의 안전장치).
-  const myRosterEntry = (employees || []).find(e => e.name === currentUser.name && e.branch === currentUser.branch) || (employees || []).find(e => e.id === currentUser.id);
+  const myRosterEntry = (employees || []).find(e => e.name === currentUser.name && e.branch === currentUser.branch) || (employees || []).find(e => e.id === currentUser.id) || guestRosterEntry_(currentUser);
   const myCode = (myRosterEntry === null || myRosterEntry === void 0 ? void 0 : myRosterEntry.code) || "";
   const myBaseCode = (myRosterEntry === null || myRosterEntry === void 0 ? void 0 : myRosterEntry.baseCode) || "";
   const myTeamKey = REVERSE_TEAM_MAP[currentUser.branch];
@@ -5966,7 +6006,7 @@ function LotteryApplyPanel({
 
   // 본인 교번틀 기준으로 그 날짜의 실제 교번을 계산 (자기 휴가 신청 폼과 동일한 방식)
   // 이름+소속 우선, ID는 보조로 찾아요 (본인 신청 폼과 동일한 방식 - 위 주석 참고)
-  const myEmp = (employees || []).find(e => e.name === currentUser.name && e.branch === currentUser.branch) || (employees || []).find(e => e.id === currentUser.id);
+  const myEmp = (employees || []).find(e => e.name === currentUser.name && e.branch === currentUser.branch) || (employees || []).find(e => e.id === currentUser.id) || guestRosterEntry_(currentUser);
   const myBaseCode = myEmp ? myEmp.baseCode : "";
   const myTeamKey = REVERSE_TEAM_MAP[currentUser.branch];
   const myOrder = GYOBUN_ORDER[myTeamKey] || [];
