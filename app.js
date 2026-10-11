@@ -150,6 +150,7 @@ function koreaCurrentHour() {
   return kst.getHours();
 }
 
+
 // 오늘이 "짝수달 1일"인지 확인 (경산 - 다음 두 달 휴가를 선착순으로 신청받는 날, 순번 조정 가능일)
 // ⚠️ TEST_MODE일 때는 실제 날짜와 무관하게 항상 "짝수달 1일"로 간주해서 순번 수정 기능을 바로 테스트할 수 있어요.
 // 실제 운영 전환 시 TEST_MODE를 false로 바꾸면 이 우회도 자동으로 꺼져요.
@@ -168,8 +169,7 @@ function isEvenMonthFirstDay() {
 function isPeakOpeningWindow() {
   if (TEST_MODE) return true;
   if (!isEvenMonthFirstDay()) return false;
-  const hour = koreaCurrentHour();
-  return hour === 9;
+  return koreaCurrentHour() === 9;
 }
 function parseLocalDate_(dateStr) {
   const [y, m, d] = String(dateStr).split("-").map(Number);
@@ -1534,6 +1534,15 @@ function formatEntryDateOnly(ts) {
 
 // 경산 팀 자체 규정 - 짝수달 1~5일 사이 신청한 휴가, 휴가일 7일 전부터는 본인 취소 불가 (여러 화면에서 공용으로 사용)
 // 단, 짝수달 1일에 신청한 휴가는 1일 당일에 한해 취소 가능
+// 취소 불가일 때 보여줄 안내 (규정 이유 + 특수 사유는 운용 문의)
+function cancelBlockedMessage_(reason) {
+  return "⚠️ " + reason + "\n\n교육, 병가 등 부득이한 특수 사유가 있으면 운용에 문의해 주세요.";
+}
+// 취소 버튼 모양 - 취소 가능하면 빨간 "취소", 규정상 불가면 회색 "취소불가"
+const CANCEL_BLOCKED_STYLE_ = {
+  color: "#aaa",
+  textDecoration: "none"
+};
 function checkSelfCancelAllowed(branch, record) {
   if (!GS_ONLY) return {
     ok: true
@@ -1736,22 +1745,28 @@ function isCapacityType(type) {
 function renumberDayPriorities_(dateStr, branch, onDone) {
   VacFacade.getByDate(dateStr, branch).then(records => {
     // 취소된 기록도 그 번호를 계속 차지해요 (취소됐다고 뒷사람이 번호를 당겨쓰지 않아요).
-    // 기준은 "지금 순번 순서" 그대로예요 - 짝수달 1일에 손으로 고친 순번이 재정렬로 날아가지 않게,
-    // 순서는 유지하고 빈 번호만 메워요. 순번이 없는 기록(비번 짝 등)은 입력 시각 순으로 맨 뒤에 붙어요.
-    const capacityAll = (records || []).filter(v => v.branch === branch && isCapacityType(v.vacationType)).sort((a, b) => {
-      const pa = a.priority != null && a.priority !== "" ? Number(a.priority) : Infinity;
-      const pb = b.priority != null && b.priority !== "" ? Number(b.priority) : Infinity;
-      if (pa !== pb) return pa - pb;
-      // 같은 순번이거나 둘 다 순번이 없으면 입력 날짜/시간(createdAt) 순서. 없는 기록(옛날 가져오기 등)은 맨 뒤로.
-      const ta = timestampToMillis_(a.createdAt);
-      const tb = timestampToMillis_(b.createdAt);
-      if (ta == null && tb == null) return (a.name || "").localeCompare(b.name || "");
-      if (ta == null) return 1;
-      if (tb == null) return -1;
-      if (ta !== tb) return ta - tb;
-      return (a.name || "").localeCompare(b.name || "");
+    // 짝수달 1일에 손으로 고친 순번이 재정렬로 날아가지 않게, 순번 있는 기록의 순서는 유지하고 빈 번호만 메워요.
+    // 순번이 있는 기록은 지금 순번 순서 그대로 두고, 순번이 없는 기록(예전에 자동으로 들어간 비번 짝 등)은
+    // 입력 시각 기준으로 제자리에 끼워 넣어요. 예) 9/1에 입력된 비번은 10/1 이후 신청자들보다 앞 번호.
+    const all = (records || []).filter(v => v.branch === branch && isCapacityType(v.vacationType));
+    const hasP = v => v.priority != null && v.priority !== "";
+    const timeOf = v => {
+      const t = timestampToMillis_(v.createdAt);
+      return t == null ? Infinity : t;
+    };
+    const capacityAll = all.filter(hasP).sort((a, b) => Number(a.priority) - Number(b.priority) || timeOf(a) - timeOf(b) || (a.name || "").localeCompare(b.name || ""));
+    all.filter(v => !hasP(v)).sort((a, b) => timeOf(a) - timeOf(b)).forEach(v => {
+      const t = timeOf(v);
+      const pos = capacityAll.findIndex(o => hasP(o) && timeOf(o) > t);
+      if (pos === -1) capacityAll.push(v);else capacityAll.splice(pos, 0, v);
     });
     const updates = [];
+    // 보장인원 미포함으로 바뀐 기록에 남은 순번은 지워요 (그 번호가 비어 보이는 원인이 돼요)
+    (records || []).filter(v => v.branch === branch && !isCapacityType(v.vacationType) && v.priority != null && v.priority !== "").forEach(v => {
+      updates.push(VacFacade.update(v.branch, v.date, v.id, {
+        priority: null
+      }));
+    });
     capacityAll.forEach((v, idx) => {
       const newPriority = idx + 1;
       if (v.priority !== newPriority) {
@@ -1765,6 +1780,12 @@ function renumberDayPriorities_(dateStr, branch, onDone) {
     // 그날이 속한 달의 달력 캐시를 지워둬요 - 순번이 바뀐 채로 캐시가 오래 남지 않게
     if (freshRecords && onDone) onDone(freshRecords);
   }).catch(err => console.error("순번 재정렬 실패:", err));
+}
+
+// 새 기록에 붙일 다음 순번 - 기록 수와 가장 큰 번호 중 큰 쪽 + 1 (빈 번호·중복이 있어도 겹치지 않게)
+function nextPriorityFor_(records, branch) {
+  const caps = (records || []).filter(v => v.branch === branch && isCapacityType(v.vacationType));
+  return Math.max(caps.length, caps.reduce((m, v) => Math.max(m, Number(v.priority) || 0), 0)) + 1;
 }
 
 // 순번 끼워넣기 - 한 사람의 순번을 newPos로 옮기면 사이에 있던 사람들이 한 칸씩 당겨지거나 밀려요.
@@ -2448,8 +2469,10 @@ function MainScreen({
   const [showManagerAdmin, setShowManagerAdmin] = useState(false);
   const [showImportTest, setShowImportTest] = useState(false);
   const [showMyVacations, setShowMyVacations] = useState(false);
+  const [showGuide, setShowGuide] = useState(false); // 📖 사용법
   const [showLotteryAdmin, setShowLotteryAdmin] = useState(false); // 명절 추첨 관리 (관리자)
   const [showLotteryApply, setShowLotteryApply] = useState(false); // 명절 추첨 응모 (기관사)
+  const [lotteryOpenNow, setLotteryOpenNow] = useState(false); // 지금 명절 응모 기간인지 (버튼 강조용)
   const [showHyuchungdangAdmin, setShowHyuchungdangAdmin] = useState(false); // 휴충당 관리 (관리자, 경산 전용)
   const [showAdminMenu, setShowAdminMenu] = useState(false); // 관리자 메뉴 모음
   const [showRosterChange, setShowRosterChange] = useState(false); // 교번 변경 예약 (관리자)
@@ -2852,6 +2875,8 @@ function MainScreen({
     if (isMidManager) return;
     waitForFirestore().then(() => Promise.all([loadCachedList(LOTTERY_EVENTS_CACHE_KEY, LOTTERY_EVENTS_CACHE_TTL_MS, () => window.LotteryAPI.listEvents()), window.LotteryAPI.listMyEntries(currentUser.id)])).then(([events, entries]) => {
       const today = koreaTodayStr();
+      // 응모 기간 중인 이벤트가 있으면 🎋 명절 응모 버튼을 주황색으로 강조해요
+      setLotteryOpenNow((events || []).some(e => e.status === "응모중" && e.applyStart <= today && today <= e.applyEnd));
       const drawnTodayEventIds = new Set((events || []).filter(e => e.status === "추첨완료" && e.updatedAt && formatEntryDateOnly(e.updatedAt) === today).map(e => e.id));
       const results = (entries || []).filter(en => en.result !== "대기중" && drawnTodayEventIds.has(en.eventId));
       setLotteryResultsToShow(results);
@@ -3001,7 +3026,7 @@ function MainScreen({
   // 날짜 모달/사이드 패널(내 휴가현황·승인 관리·운용 인원·가져오기 테스트) 공통으로 쓰는 닫기 함수.
   // 뒤로가기 버튼을 눌러도 popstate 핸들러가 똑같이 처리해서, 항상 달력 화면으로 돌아가요.
   const closeModal = () => {
-    if (selectedDate || showAdmin || showManagerAdmin || showImportTest || showMyVacations || showLotteryAdmin || showLotteryApply || showHyuchungdangAdmin || showAdminMenu || showDataReset || showRosterChange) {
+    if (selectedDate || showAdmin || showManagerAdmin || showImportTest || showMyVacations || showGuide || showLotteryAdmin || showLotteryApply || showHyuchungdangAdmin || showAdminMenu || showDataReset || showRosterChange) {
       window.history.back();
     }
   };
@@ -3038,6 +3063,7 @@ function MainScreen({
       setShowManagerAdmin(false);
       setShowImportTest(false);
       setShowMyVacations(false);
+      setShowGuide(false);
       setShowLotteryAdmin(false);
       setShowLotteryApply(false);
       setShowHyuchungdangAdmin(false);
@@ -3090,6 +3116,19 @@ function MainScreen({
     };
   }, [selectedDate, isMidManager, isWideScreen, monthMap, currentUser.branch]);
   const dayRecords = selectedDate ? (monthMap[selectedDate] || []).filter(v => v.branch === currentUser.branch) : [];
+  // 날짜를 열었을 때 순번이 꼬여 있으면(순번 없는 비번 짝, 빈 번호, 같은 번호 2개) 한 번 정리해요.
+  // 지금 순서는 그대로 두고 1번부터 다시 매기며, 순번 없는 기록은 맨 뒤 번호를 받아요. 정리되면 다시 실행되지 않아요.
+  const missingPriorityKey = selectedDate && (() => {
+    const caps = dayRecords.filter(v => isCapacityType(v.vacationType));
+    if (caps.some(v => v.priority == null || v.priority === "")) return true;
+    const nums = caps.map(v => Number(v.priority)).sort((a, b) => a - b);
+    // 1번부터 빠짐없이·겹치지 않게 이어져야 정상 (취소 기록도 번호를 가지고 있어요)
+    return nums.some((n, i) => n !== i + 1);
+  })() ? selectedDate : null;
+  useEffect(() => {
+    if (!missingPriorityKey) return;
+    renumberDayPriorities(missingPriorityKey, currentUser.branch);
+  }, [missingPriorityKey]);
   const sortedDayRecords = sortRecordsForDisplay(dayRecords);
   const activeRecordsForCapacity = dayRecords.filter(v => v.status !== "취소됨");
   const activeCount = activeRecordsForCapacity.length;
@@ -3137,7 +3176,7 @@ function MainScreen({
   const handleSelfCancelClick = record => {
     const check = checkSelfCancelAllowed(currentUser.branch, record);
     if (!check.ok) {
-      alert("⚠️ " + check.reason);
+      alert(cancelBlockedMessage_(check.reason));
       return;
     }
     handleCancel(record);
@@ -3305,6 +3344,8 @@ function MainScreen({
         date: nextDateStr
       }).then(() => {
         companionSaved = true;
+        // 자동으로 들어간 비번도 보장인원 자리를 차지하니 순번을 붙여요 (맨 뒤 번호)
+        renumberDayPriorities(nextDateStr, currentUser.branch);
       }).catch(err => {
         console.error("비번 자동 등록 실패:", err);
         alert("휴가는 저장됐지만, 다음날 비번 자동 등록에 실패했어요. 다음날에 직접 비번을 추가로 입력해주세요.");
@@ -3354,18 +3395,36 @@ function MainScreen({
       console.error(err);
       if (err && err.message === "CAPACITY_FULL") {
         alert(`앗, 저장하는 순간 보장인원(${err.capacity}명)이 다 찼어요. 다른 날짜를 선택해주세요.`);
-        loadMonth(viewYear, viewMonth);
+        refreshDays([selectedDate, nextDateStr]);
         setShowRegisterForm(false);
         return;
       }
       if (err && err.message === "DUPLICATE_ENTRY") {
         alert("이미 이 날짜에 신청하신 기록이 있어요. 화면을 새로고침할게요.");
-        loadMonth(viewYear, viewMonth);
+        refreshDays([selectedDate, nextDateStr]);
         setShowRegisterForm(false);
         return;
       }
       alert("등록에 실패했어요: " + (err && err.message ? err.message : err));
     }).finally(() => setSaving(false));
+  };
+  // 오류(마감·중복 등) 뒤 화면 갱신용 - 달 전체(최대 31회 읽기) 대신 관련 날짜만 다시 읽어요.
+  // 실시간 구독 중(오픈 직후 9시대)엔 어차피 자동 반영되니 아예 읽지 않아요.
+  const refreshDays = dates => {
+    if (inPeakWindow) return;
+    const list = [...new Set((dates || []).filter(Boolean))];
+    if (!list.length) return;
+    waitForFirestore().then(() => Promise.all(list.map(d => VacFacade.getByDate(d, currentUser.branch).then(recs => [d, recs])))).then(pairs => {
+      setMonthMap(prev => {
+        const next = {
+          ...prev
+        };
+        pairs.forEach(([d, recs]) => {
+          next[d] = (recs || []).filter(v => v.branch === currentUser.branch).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+        });
+        return next;
+      });
+    }).catch(err => console.error("날짜 갱신 실패:", err));
   };
   // 비번 먼저 신청 → 전날 야간 + 오늘 비번(연차비 등)을 한 번에 저장해요. 두 날짜 정원을 모두 확인하고,
   // 비번 저장이 실패하면 방금 넣은 야간도 되돌려서 반쪽만 남지 않게 해요.
@@ -3380,7 +3439,7 @@ function MainScreen({
     const activeOf = list => (list || []).filter(v => v.branch === branch && v.status !== "취소됨");
     const fail = msg => {
       alert(msg);
-      loadMonth(viewYear, viewMonth);
+      refreshDays([nightDate, selectedDate]);
       setShowRegisterForm(false);
     };
     setSaving(true);
@@ -3417,7 +3476,7 @@ function MainScreen({
       };
       nightGuard(nightRecs); // 미리 확인 (실패하면 아래 catch로)
       offGuard(dayRecs);
-      const nightPriority = capType ? (nightRecs || []).filter(v => v.branch === branch && isCapacityType(v.vacationType)).length + 1 : null;
+      const nightPriority = capType ? nextPriorityFor_(nightRecs, branch) : null;
       const base = {
         name: currentUser.name,
         branch,
@@ -3459,6 +3518,7 @@ function MainScreen({
             status: "정상"
           }]
         }));
+        renumberDayPriorities(selectedDate, branch); // 비번에도 순번을 붙여요
         alert(`전날(${nightDate}) 야간 ${nightDia}와 오늘 비번 ${offDia}가 같이 신청됐어요.`);
       });
     }).catch(err => {
@@ -3482,7 +3542,7 @@ function MainScreen({
       if (alreadyMine) {
         setSaving(false);
         alert("이미 이 날짜에 신청하신 기록이 있어요. 화면을 새로고침할게요.");
-        loadMonth(viewYear, viewMonth);
+        refreshDays([selectedDate]);
         setShowRegisterForm(false);
         return;
       }
@@ -3491,7 +3551,7 @@ function MainScreen({
       if (freshCapacityCount >= capacity) {
         setSaving(false);
         alert(`앗, 방금 다른 분이 신청해서 이 날짜의 보장인원(${capacity}명)이 다 찼어요. 다른 날짜를 선택해주세요.`);
-        loadMonth(viewYear, viewMonth); // 화면도 최신 상태로 갱신
+        refreshDays([selectedDate]); // 화면도 최신 상태로 갱신
         setShowRegisterForm(false);
         return;
       }
@@ -3513,7 +3573,7 @@ function MainScreen({
           if (nextDayCapacityCount >= nextDayCapacity) {
             setSaving(false);
             alert(`앗, 다음날(${nextDateStr})이 이미 다 차서 야간 신청을 저장할 수 없어요. 다른 날짜를 선택해주세요.`);
-            loadMonth(viewYear, viewMonth);
+            refreshDays([selectedDate, nextDateStr]);
             setShowRegisterForm(false);
             return;
           }
@@ -3523,14 +3583,17 @@ function MainScreen({
         if (NIGHT_COMPANION_TYPE_MAP[formType] && !existingOffDuty && nextDayActive.some(v => v.employeeId === currentUser.id)) {
           setSaving(false);
           alert(`다음날(${nextDateStr})에 이미 본인 기록이 있는데, 이 야간의 비번(DIA가 ~로 끝나는 같은 종류 휴가)이 아니라서 연결할 수 없어요. 다음날 기록을 먼저 확인해주세요.`);
-          loadMonth(viewYear, viewMonth);
+          refreshDays([selectedDate, nextDateStr]);
           setShowRegisterForm(false);
           return;
         }
       }
 
       // 순번(짝수달 1일 선착순 신청용) - 그 날짜 보장휴가 기록 수(취소 포함) 다음 번호로 자동 부여
-      const priorityBase = (freshDayRecords || []).filter(v => v.branch === currentUser.branch && isCapacityType(v.vacationType)).length;
+      const capRecs = (freshDayRecords || []).filter(v => v.branch === currentUser.branch && isCapacityType(v.vacationType));
+      const maxPriority = capRecs.reduce((m, v) => Math.max(m, Number(v.priority) || 0), 0);
+      // 기록 수와 가장 큰 번호 중 큰 쪽 다음 번호 - 순번에 빈칸·중복이 있어도 겹치지 않게
+      const priorityBase = Math.max(capRecs.length, maxPriority);
       const nextPriority = isCapacityType(formType) ? priorityBase + 1 : null;
       // 트랜잭션 안에서 한 번 더 정원을 확인하는 검사 함수 - 위의 확인과 저장 사이에
       // 다른 사람이 끼어들어도 여기서 막혀요
@@ -3672,7 +3735,7 @@ function MainScreen({
           alert(`${target.name}님은 전날(${nightDate})에 이미 기록이 있어서 야간을 자동으로 넣을 수 없어요. 전날 기록을 먼저 확인해주세요.`);
           return;
         }
-        const nightPriority = isCapacityType(finalVacationType) ? (nightRecs || []).filter(v => v.branch === branch && isCapacityType(v.vacationType)).length + 1 : null;
+        const nightPriority = isCapacityType(finalVacationType) ? nextPriorityFor_(nightRecs, branch) : null;
         const common = {
           name: target.name,
           branch,
@@ -3717,6 +3780,7 @@ function MainScreen({
               status: "정상"
             }]
           }));
+          if (isCapacityType(companionTypeOff)) renumberDayPriorities(selectedDate, branch);
           alert(`${target.name}님 전날(${nightDate}) 야간 ${nightDia}와 비번 ${finalDia}를 같이 기록했어요.`);
         }));
       }).catch(err => {
@@ -3804,7 +3868,10 @@ function MainScreen({
             companionRecord: null
           };
         }
-        return VacFacade.add(currentUser.branch, nextDateStr, companionRecord).then(id => ({
+        return VacFacade.add(currentUser.branch, nextDateStr, companionRecord).then(id => {
+          if (isCapacityType(companionType)) renumberDayPriorities(nextDateStr, currentUser.branch);
+          return id;
+        }).then(id => ({
           savedRecord,
           companionRecord: {
             id,
@@ -4137,7 +4204,7 @@ function MainScreen({
           ...tbl.td,
           padding: "6px 3px"
         }
-      }, v.priority != null ? v.priority : idx + 1), /*#__PURE__*/React.createElement("td", {
+      }, isCapacityType(v.vacationType) && v.priority != null && v.priority !== "" ? v.priority : idx + 1), /*#__PURE__*/React.createElement("td", {
         style: {
           ...tbl.td,
           textAlign: "left",
@@ -4210,13 +4277,26 @@ function MainScreen({
     style: adminStyles.adminBtn,
     onClick: () => openPanel(setShowMyVacations)
   }, "내 휴가현황"), !isMidManager && !ghosting && /*#__PURE__*/React.createElement("button", {
-    style: adminStyles.adminBtn,
+    style: lotteryOpenNow ? {
+      ...adminStyles.adminBtn,
+      background: "#D85A30",
+      color: "#fff",
+      border: "1px solid #D85A30"
+    } : adminStyles.adminBtn,
     onClick: () => openPanel(setShowLotteryApply)
   }, "🎋 명절 응모"), isMidManager && !ghosting && /*#__PURE__*/React.createElement("button", {
     style: adminStyles.adminBtn,
     onClick: () => openPanel(setShowHyuchungdangAdmin)
-  }, "🔁 휴충당 신청 현황"), isAdmin && /*#__PURE__*/React.createElement("button", {
+  }, "🔁 휴충당 신청 현황"), !isMidManager && /*#__PURE__*/React.createElement("button", {
     style: adminStyles.adminBtn,
+    onClick: () => openPanel(setShowGuide)
+  }, "📖 사용법"), isAdmin && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...adminStyles.adminBtn,
+      background: "#185FA5",
+      color: "#fff",
+      border: "1px solid #185FA5"
+    },
     onClick: () => openPanel(setShowAdminMenu)
   }, "⚙️ 관리자 메뉴"), isSuperAdmin && /*#__PURE__*/React.createElement("button", {
     style: {
@@ -4829,7 +4909,7 @@ function MainScreen({
           color: "#1b3a5c"
         },
         onClick: () => handleStartPriorityEdit(v)
-      }, v.priority != null ? v.priority : idx + 1, "✏️") : v.priority != null ? v.priority : idx + 1), /*#__PURE__*/React.createElement("td", {
+      }, isCapacityType(v.vacationType) && v.priority != null && v.priority !== "" ? v.priority : idx + 1, "✏️") : isCapacityType(v.vacationType) && v.priority != null && v.priority !== "" ? v.priority : idx + 1), /*#__PURE__*/React.createElement("td", {
         style: {
           ...tbl.td,
           textAlign: "left"
@@ -4975,13 +5055,17 @@ function MainScreen({
         }
       }, "대기중")), /*#__PURE__*/React.createElement("td", {
         style: tbl.td
-      }, !cancelled && v.employeeId === currentUser.id && !v.confirmedBy && !v.recordedBy && /*#__PURE__*/React.createElement("button", {
-        style: {
-          ...modal.smallCancelBtn,
-          margin: 0
-        },
-        onClick: () => handleSelfCancelClick(v)
-      }, "취소"), !cancelled && isMidManager && v.employeeId !== currentUser.id && isCapacityType(v.vacationType) && /*#__PURE__*/React.createElement("button", {
+      }, !cancelled && v.employeeId === currentUser.id && !v.confirmedBy && !v.recordedBy && (() => {
+        const cancelOk = checkSelfCancelAllowed(currentUser.branch, v).ok;
+        return /*#__PURE__*/React.createElement("button", {
+          style: {
+            ...modal.smallCancelBtn,
+            margin: 0,
+            ...(cancelOk ? {} : CANCEL_BLOCKED_STYLE_)
+          },
+          onClick: () => handleSelfCancelClick(v)
+        }, cancelOk ? "취소" : "취소불가");
+      })(), !cancelled && isMidManager && v.employeeId !== currentUser.id && isCapacityType(v.vacationType) && /*#__PURE__*/React.createElement("button", {
         style: {
           ...modal.smallCancelBtn,
           margin: 0
@@ -5226,12 +5310,17 @@ function MainScreen({
     onClose: closeModal,
     employees: employees,
     managers: managers
+  })), showGuide && /*#__PURE__*/React.createElement(ErrorBoundary, {
+    onClose: closeModal
+  }, /*#__PURE__*/React.createElement(GuidePanel, {
+    onClose: closeModal
   })), showMyVacations && /*#__PURE__*/React.createElement(ErrorBoundary, {
     onClose: closeModal
   }, /*#__PURE__*/React.createElement(MyVacationsPanel, {
     currentUser: currentUser,
     onClose: closeModal,
-    employees: employees
+    employees: employees,
+    holidaySet: holidaySet
   })), showLotteryAdmin && /*#__PURE__*/React.createElement(ErrorBoundary, {
     onClose: closeModal
   }, /*#__PURE__*/React.createElement(LotteryAdminPanel, {
@@ -5615,10 +5704,142 @@ const adminStyles = {
     gap: "3px"
   }
 };
+/* ------------------------------------------------------------------ */
+/* 📖 사용법 (기관사용) - 자주 받는 질문 모음. 누르면 답이 펼쳐져요.          */
+/* 내용 수정은 아래 GUIDE_ITEMS만 고치면 돼요.                              */
+/* - 문장 안의 **글자**는 굵게 표시돼요                                     */
+/* - "• "로 시작하는 줄은 목록처럼 들여쓰기돼요                             */
+/* ------------------------------------------------------------------ */
+const GUIDE_ITEMS = [{
+  q: "휴가는 어떻게 신청해요?",
+  a: ["달력에서 날짜를 누르고 **+ 휴가 신청** → 휴가 종류를 고르고 저장하면 돼요.", "DIA는 내 교번에 맞춰 자동으로 채워져요.", "보장인원 포함 휴가는 **입력한 순서대로** 순번이 붙어요."]
+}, {
+  q: "\"보장대상 5/5명 (여유 0명)\"은 뭐예요?",
+  a: ["그날 연차·분지·장재로 쉴 수 있는 인원이에요. **여유가 0명이면 신청할 수 없어요.**", "청휴·병가 등은 이 인원에 포함되지 않아요.", "휴가자 중에 비번(DIA가 ~로 끝남)이 있거나 전날 야간 휴가가 있으면 1명이 더 늘어나요."]
+}, {
+  q: "야간 휴가는 어떻게 내요?",
+  a: ["야간 날짜(예: 25d)나 다음날 비번(예: 25~) **중 하나만** 신청하면 나머지 날짜는 자동으로 같이 들어가요.", "두 날짜 모두 자리가 있어야 신청돼요.", "취소할 때도 한쪽만 취소하면 다른 쪽이 같이 취소돼요."]
+}, {
+  q: "휴가 취소는 어떻게 하나요?",
+  a: ["두 군데서 할 수 있어요.", "• 달력에서 날짜를 누르고, 목록의 내 이름 줄에 있는 빨간 **취소** 누르기", "• **내 휴가현황**에서 해당 날짜 옆 **취소** 누르기", "야간 휴가는 한쪽만 취소해도 비번까지 같이 취소돼요."]
+}, {
+  q: "휴가 종류를 잘못 입력했어요.",
+  a: ["**내 휴가현황** → 해당 날짜 옆 **수정**에서 바꿀 수 있어요.", "야간 휴가는 야간 날짜에서 수정하면 비번도 같이 바뀌어요.", "청휴·병가를 연차 등으로 바꿀 때는 그날 자리가 있어야 해요.", "운용이 이미 확인했거나 대신 입력한 기록은 운용에 말씀해 주세요."]
+}, {
+  q: "내 휴가는 어디서 봐요?",
+  a: ["**내 휴가현황**에서 예정된 휴가, 올해 종류별 사용 개수, 신청한 휴충당을 볼 수 있어요."]
+}, {
+  q: "다른 사람과 교번 자리를 바꾸게 됐어요.",
+  a: ["**관리자에게 바꾸는 날짜와 상대방을 알려주세요.** 관리자가 앱에 미리 등록해 두면, 그 날짜부터는 앱이 자동으로 새 교번 기준으로 DIA를 채우고 계산해요. 그 전 날짜는 원래 교번 그대로예요.", "바꾸는 날짜 전에 미리 알려주시면 가장 좋아요.", "등록 전에 이미 신청한 휴가는 DIA가 옛 교번으로 남아 있으니 **내 휴가현황 → 수정**에서 DIA를 고쳐주세요."]
+}, {
+  q: "휴충당은 어떻게 신청해요?",
+  a: ["내 교번이 휴무인 날짜를 누르면 **🔁 휴충당 신청** 버튼이 보여요.", "확정되면 앱을 열 때 알림이 떠요."]
+}, {
+  q: "명절 연휴 휴가는 어떻게 신청해요?",
+  a: ["명절 응모 기간에 **🎋 명절 응모**에서 신청하면 추첨으로 정해져요.", "결과는 앱을 열 때 알림으로 알려드려요."]
+}, {
+  q: "PIN을 잊었어요.",
+  a: ["로그인 화면의 **PIN을 잊으셨나요? 다시 등록하기**를 누르고 처음부터 다시 등록하면 돼요.", "다시 등록하면 관리자 승인을 다시 받아야 해요."]
+}];
+
+// "**굵게**" 표시를 실제 굵은 글씨로 바꿔요
+function renderGuideText_(text) {
+  return String(text).split(/(\*\*[^*]+\*\*)/).filter(Boolean).map((part, i) => part.startsWith("**") && part.endsWith("**") ? /*#__PURE__*/React.createElement("strong", {
+    key: i,
+    style: {
+      color: "#1b3a5c"
+    }
+  }, part.slice(2, -2)) : part);
+}
+function GuidePanel({
+  onClose
+}) {
+  const [openIdx, setOpenIdx] = useState(null);
+  return /*#__PURE__*/React.createElement("div", {
+    style: modal.overlay,
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    style: modal.sheet,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...modal.dateTitle,
+      marginBottom: "6px"
+    }
+  }, "📖 D휴가 사용법"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...modal.countText,
+      marginBottom: "12px"
+    }
+  }, "궁금한 질문을 누르면 답이 펼쳐져요."), GUIDE_ITEMS.map((item, idx) => {
+    const open = openIdx === idx;
+    return /*#__PURE__*/React.createElement("div", {
+      key: idx,
+      style: {
+        border: "1px solid " + (open ? "#1b3a5c" : "#e3e6ec"),
+        borderRadius: "12px",
+        marginBottom: "8px",
+        background: open ? "#f4f7fb" : "#fff",
+        overflow: "hidden"
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => setOpenIdx(open ? null : idx),
+      style: {
+        width: "100%",
+        textAlign: "left",
+        background: "none",
+        border: "none",
+        padding: "13px 14px",
+        fontSize: "15px",
+        fontWeight: 700,
+        color: "#1a1a1a",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: "8px",
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement("span", null, "Q. ", item.q), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "#888",
+        fontSize: "13px",
+        flexShrink: 0
+      }
+    }, open ? "▲" : "▼")), open && /*#__PURE__*/React.createElement("div", {
+      style: {
+        padding: "0 14px 14px",
+        fontSize: "14px",
+        lineHeight: 1.65,
+        color: "#333"
+      }
+    }, item.a.map((line, li) => {
+      const bullet = line.startsWith("• ");
+      return /*#__PURE__*/React.createElement("div", {
+        key: li,
+        style: {
+          marginTop: li === 0 ? 0 : "6px",
+          paddingLeft: bullet ? "10px" : 0
+        }
+      }, renderGuideText_(line));
+    })));
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...modal.countText,
+      textAlign: "center",
+      margin: "10px 0"
+    }
+  }, "여기 없는 내용은 운용이나 관리자에게 문의해 주세요."), /*#__PURE__*/React.createElement("button", {
+    style: modal.closeBtn,
+    onClick: onClose
+  }, "닫기")));
+}
+
 function MyVacationsPanel({
   currentUser,
   onClose,
-  employees
+  employees,
+  holidaySet
 }) {
   const [list, setList] = useState([]);
   const [yearStats, setYearStats] = useState([]); // 올해 종류별 보장휴가 사용 개수
@@ -5686,7 +5907,7 @@ function MyVacationsPanel({
   const handleCancelMine = record => {
     const check = checkSelfCancelAllowed(currentUser.branch, record);
     if (!check.ok) {
-      alert("⚠️ " + check.reason);
+      alert(cancelBlockedMessage_(check.reason));
       return;
     }
     if (!confirm(`${record.date} ${record.vacationType} 기록을 취소할까요?`)) return;
@@ -5730,10 +5951,61 @@ function MyVacationsPanel({
       return;
     }
     setEditSaving(true);
-    findNightPair(record).then(pairRecord => VacFacade.update(record.branch, record.date, record.id, {
+    const branch = record.branch;
+    const hs = holidaySet || new Set();
+    const activeOthers = (list, excludeId) => (list || []).filter(v => v.branch === branch && v.status !== "취소됨" && v.id !== excludeId);
+    // 보장인원 미포함 → 포함 종류로 바꾸면 그날 자리를 하나 더 차지하게 되니 정원을 확인해요
+    // (신청할 때와 같은 기준 - 수정으로 정원을 넘기는 우회를 막아요)
+    const checkCapacity = pairRecord => {
+      const edited = {
+        ...record,
+        vacationType: editType,
+        dia: trimmedDia
+      };
+      const checks = [];
+      if (!isCapacityType(record.vacationType) && isCapacityType(editType)) {
+        checks.push(Promise.all([VacFacade.getByDate(record.date, branch), VacFacade.getByDate(shiftDateStr_(record.date, -1), branch)]).then(([dayRecs, prevRecs]) => {
+          const others = activeOthers(dayRecs, record.id);
+          const cnt = others.filter(v => isCapacityType(v.vacationType)).length;
+          const cap = gyeongsanCapacity(branch, record.date, [...others, edited], hs, activeOthers(prevRecs));
+          if (cnt >= cap) throw new Error(`${record.date}은 보장인원(${cap}명)이 다 차서 ${editType}(으)로 바꿀 수 없어요.`);
+        }));
+      }
+      // 야간 짝 비번도 미포함 → 포함 종류로 바뀌면(예: 청휴비 → 연차비) 다음날 정원도 확인해요
+      const newCompanionType = NIGHT_COMPANION_TYPE_MAP[editType];
+      const stillNight = newCompanionType && isNightShiftCode(trimmedDia, branch);
+      if (pairRecord && stillNight && !isCapacityType(pairRecord.vacationType) && isCapacityType(newCompanionType)) {
+        checks.push(Promise.all([VacFacade.getByDate(pairRecord.date, branch), VacFacade.getByDate(record.date, branch)]).then(([nextRecs, dayRecs]) => {
+          const others = activeOthers(nextRecs, pairRecord.id);
+          const cnt = others.filter(v => isCapacityType(v.vacationType)).length;
+          const prevWithEdited = [...activeOthers(dayRecs, record.id), edited];
+          const cap = gyeongsanCapacity(branch, pairRecord.date, [...others, {
+            ...pairRecord,
+            vacationType: newCompanionType,
+            dia: nightDiaToOffDutyDia(trimmedDia)
+          }], hs, prevWithEdited);
+          if (cnt >= cap) throw new Error(`다음날(${pairRecord.date}) 비번 자리가 다 차서(보장인원 ${cap}명) ${editType}(으)로 바꿀 수 없어요.`);
+        }));
+      }
+      return Promise.all(checks).then(() => pairRecord);
+    };
+    // 보장인원 포함 ↔ 미포함이 바뀌면 그날 순번을 다시 정리해요.
+    // (미포함으로 바뀐 기록은 순번을 비워서, 순번이 1번부터 빠짐없이 이어지게)
+    const capChanged = isCapacityType(record.vacationType) !== isCapacityType(editType);
+    findNightPair(record).then(checkCapacity).then(pairRecord => VacFacade.update(record.branch, record.date, record.id, {
       vacationType: editType,
-      dia: trimmedDia
-    }).then(() => pairRecord)).then(pairRecord => {
+      dia: trimmedDia,
+      ...(capChanged && !isCapacityType(editType) ? {
+        priority: null
+      } : {})
+    }).then(() => {
+      if (capChanged) renumberDayPriorities_(record.date, record.branch);
+      if (pairRecord && isCapacityType(pairRecord.vacationType) !== isCapacityType(NIGHT_COMPANION_TYPE_MAP[editType] || "")) {
+        // 짝 비번의 종류도 바뀌니 다음날도 정리 (짝 갱신이 끝난 뒤 실행되도록 살짝 늦춰요)
+        setTimeout(() => renumberDayPriorities_(pairRecord.date, pairRecord.branch), 1500);
+      }
+      return pairRecord;
+    })).then(pairRecord => {
       setList(prev => prev.map(v => v.id === record.id ? {
         ...v,
         vacationType: editType,
@@ -5909,10 +6181,16 @@ function MyVacationsPanel({
         color: "#1b3a5c"
       },
       onClick: () => handleStartEdit(v)
-    }, "수정"), /*#__PURE__*/React.createElement("button", {
-      style: modal.smallCancelBtn,
-      onClick: () => handleCancelMine(v)
-    }, "취소")))), editingId === v.id ? /*#__PURE__*/React.createElement("div", {
+    }, "수정"), (() => {
+      const cancelOk = checkSelfCancelAllowed(currentUser.branch, v).ok;
+      return /*#__PURE__*/React.createElement("button", {
+        style: {
+          ...modal.smallCancelBtn,
+          ...(cancelOk ? {} : CANCEL_BLOCKED_STYLE_)
+        },
+        onClick: () => handleCancelMine(v)
+      }, cancelOk ? "취소" : "취소불가");
+    })()))), editingId === v.id ? /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         flexDirection: "column",
@@ -6396,6 +6674,11 @@ function LotteryApplyPanel({
 /* ------------------------------------------------------------------ */
 /* 명절 연휴 추첨 - 관리자 패널                                          */
 /* ------------------------------------------------------------------ */
+// 명절 추첨 이벤트의 마지막 대상 날짜 (지난 추첨 판단·1년 뒤 자동 정리 기준)
+function lotteryEventLastDate_(event) {
+  const dates = (event && event.dates || []).map(d => d.date).filter(Boolean).sort();
+  return dates.length ? dates[dates.length - 1] : "";
+}
 function LotteryAdminPanel({
   branch,
   isSuperAdmin,
@@ -6409,6 +6692,7 @@ function LotteryAdminPanel({
   const [loading, setLoading] = useState(true);
   const [entriesByEvent, setEntriesByEvent] = useState({}); // { [eventId]: entries[] }
   const [drawing, setDrawing] = useState(null); // 추첨 진행 중인 eventId
+  const [showPastEvents, setShowPastEvents] = useState(false); // 지난 추첨 펼치기
 
   // 새 이벤트 생성 폼 상태
   const [showNewForm, setShowNewForm] = useState(false);
@@ -6424,8 +6708,19 @@ function LotteryAdminPanel({
     setLoading(true);
     waitForFirestore().then(() => window.LotteryAPI.listEvents()).then(list => {
       const branchList = (list || []).filter(e => e.branch === viewBranch);
-      setEvents(branchList);
-      return Promise.all(branchList.map(e => window.LotteryAPI.listEntriesForEvent(e.id).then(entries => [e.id, entries])));
+      // 명절 마지막 날짜로부터 1년이 지난 추첨은 자동 정리해요 (응모 기록 포함).
+      // 당첨자의 실제 휴가 기록은 달력 데이터에 따로 있어서 그대로 남아요.
+      const cutoff = shiftDateStr_(koreaTodayStr(), -365);
+      const expired = branchList.filter(e => {
+        const last = lotteryEventLastDate_(e);
+        return last && last < cutoff;
+      });
+      const kept = branchList.filter(e => !expired.includes(e));
+      setEvents(kept);
+      const cleanup = Promise.all(expired.map(e => window.LotteryAPI.listEntriesForEvent(e.id).then(entries => Promise.all((entries || []).map(en => window.LotteryAPI.cancelApply(en.id)))).then(() => window.LotteryAPI.removeEvent(e.id)))).then(() => {
+        if (expired.length) invalidateCachedList(LOTTERY_EVENTS_CACHE_KEY);
+      }).catch(err => console.error("지난 추첨 자동 정리 실패:", err));
+      return cleanup.then(() => Promise.all(kept.map(e => window.LotteryAPI.listEntriesForEvent(e.id).then(entries => [e.id, entries]))));
     }).then(pairs => {
       const map = {};
       (pairs || []).forEach(([id, entries]) => {
@@ -6795,7 +7090,39 @@ function LotteryAdminPanel({
       color: "#aaa",
       padding: "20px 0"
     }
-  }, "등록된 이벤트가 없어요"), !loading && events.map(event => {
+  }, "등록된 이벤트가 없어요"), !loading && (() => {
+    // 명절 날짜가 다 지난 추첨은 "지난 추첨"으로 접어둬요 (삭제 버튼은 그대로 있어요)
+    const today = koreaTodayStr();
+    const isPast = e => {
+      const last = lotteryEventLastDate_(e);
+      return !!last && last < today;
+    };
+    const activeEvents = events.filter(e => !isPast(e));
+    const pastEvents = events.filter(isPast);
+    return [...activeEvents, ...(pastEvents.length ? [{
+      __pastToggle: true,
+      id: "__pastToggle",
+      count: pastEvents.length
+    }] : []), ...(showPastEvents ? pastEvents : [])];
+  })().map(event => {
+    if (event.__pastToggle) {
+      return /*#__PURE__*/React.createElement("div", {
+        key: event.id
+      }, /*#__PURE__*/React.createElement("button", {
+        style: {
+          ...adminStyles.tabBtn,
+          width: "100%",
+          flex: "none",
+          margin: "6px 0"
+        },
+        onClick: () => setShowPastEvents(v => !v)
+      }, showPastEvents ? "▲ 지난 추첨 접기" : `▼ 지난 추첨 보기 (${event.count})`), showPastEvents && /*#__PURE__*/React.createElement("div", {
+        style: {
+          ...modal.countText,
+          margin: "4px 0 8px"
+        }
+      }, "명절 날짜가 지난 추첨이에요. 마지막 날짜로부터 1년이 지나면 자동으로 정리돼요."));
+    }
     const entries = entriesByEvent[event.id] || [];
     const byDate = {};
     entries.forEach(en => {
