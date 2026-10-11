@@ -8578,6 +8578,21 @@ function DataResetPanel({
     }).catch(err => alert("삭제 중 오류: " + (err && err.message ? err.message : err))).finally(() => setWorking(false));
   };
 
+  // 이 소속 휴충당 신청/지정 기록 전체 삭제 - 실사용 전환 직전에 테스트로 쌓인 휴충당을 비울 때
+  const handleResetHyuchungdang = () => {
+    if (!confirm(`⚠️ ${branch} 소속의 휴충당 신청/지정 기록을 전부 삭제할까요?\n\n` + `지금까지 신청·확정된 휴충당 기록이 전부 사라져요 (되돌릴 수 없어요). 휴가 기록은 안 건드려요.`)) return;
+    if (!confirm("정말로 진행할까요? 한 번 더 확인할게요.")) return;
+    setWorking(true);
+    Promise.resolve().then(() => {
+      if (!window.HyuchungdangAPI || typeof window.HyuchungdangAPI.removeAllForBranch !== "function") {
+        throw new Error("index.html에 HyuchungdangAPI.removeAllForBranch 함수가 없어요. index.html을 최신으로 올려주세요.");
+      }
+      return window.HyuchungdangAPI.removeAllForBranch(branch);
+    }).then(count => {
+      alert(`${branch} 휴충당 기록 ${count}건을 전부 삭제했어요.`);
+    }).catch(err => alert("삭제 중 오류: " + (err && err.message ? err.message : err))).finally(() => setWorking(false));
+  };
+
   // 수동 백업 - 자동 백업(1주 1회, 조건 맞을 때만)과 완전히 같은 로직을 그 자리에서 바로 실행해요.
   // ⚠️ 휴가앱(경산 실제 프로젝트)에서만 보이는 버튼이에요 - 실제 스프레드시트에 그대로 쓰여서,
   // 문양테스트버전에서 눌러버리면 테스트 데이터가 진짜 백업 기록에 섞여 들어가요.
@@ -8672,6 +8687,16 @@ function DataResetPanel({
     disabled: working,
     onClick: handleResetAllBranchData
   }, working ? "삭제 중..." : `🗑️ ${branch} 전체 초기화 (모든 휴가 기록 삭제)`), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...styles.button,
+      border: "1px dashed #e08a20",
+      color: "#e08a20",
+      marginBottom: "14px",
+      padding: "10px"
+    },
+    disabled: working,
+    onClick: handleResetHyuchungdang
+  }, working ? "삭제 중..." : `🔁 ${branch} 휴충당 전체 초기화 (신청/지정 기록 삭제)`), /*#__PURE__*/React.createElement("button", {
     style: modal.closeBtn,
     onClick: onClose
   }, "닫기")));
