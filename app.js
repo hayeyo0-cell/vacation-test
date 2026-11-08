@@ -4317,7 +4317,7 @@ function MainScreen({
   }, "운용 중")), /*#__PURE__*/React.createElement("div", {
     style: {
       ...cal.headerBtnRow,
-      width: "100%",
+      marginLeft: "auto",
       flexWrap: "nowrap",
       alignItems: "center",
       gap: "6px"
